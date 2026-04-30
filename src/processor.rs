@@ -64,7 +64,10 @@ impl ParallelVariantWindowProcessorBuilder {
         self
     }
 
-    pub fn output(mut self, path: impl Into<PathBuf>) -> Self {
+    /// Set the output `.vcf.gz` path. Optional: when omitted, the processor
+    /// runs in side-effect-only mode — workers apply `record_callback` to
+    /// every variant but no VCF is written and records aren't serialized.
+    pub fn with_output_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.output = Some(path.into());
         self
     }
@@ -110,7 +113,6 @@ impl ParallelVariantWindowProcessorBuilder {
 
     pub fn run(self) -> Result<()> {
         let input = self.input.ok_or_else(|| anyhow!("missing input path"))?;
-        let output = self.output.ok_or_else(|| anyhow!("missing output path"))?;
         let worker_threads = self
             .worker_threads
             .ok_or_else(|| anyhow!("missing worker_threads"))?
@@ -122,7 +124,7 @@ impl ParallelVariantWindowProcessorBuilder {
 
         ParallelVariantWindowProcessor {
             input,
-            output,
+            output: self.output,
             worker_threads,
             window_size,
             record_callback,
@@ -135,7 +137,7 @@ impl ParallelVariantWindowProcessorBuilder {
 
 pub struct ParallelVariantWindowProcessor {
     input: PathBuf,
-    output: PathBuf,
+    output: Option<PathBuf>,
     worker_threads: usize,
     window_size: u64,
     record_callback: Arc<RecordCallback>,
@@ -185,18 +187,29 @@ impl ParallelVariantWindowProcessor {
         // 3. Enumerate windows from the input header's contigs.
         let windows = enumerate_windows(&input_header, window_size, indexed_contigs.as_ref());
 
-        // 4. Open output and write the header through a multithreaded bgzf writer.
-        let file = File::create(&output)
-            .with_context(|| format!("failed to create output: {}", output.display()))?;
-        let mut mt_writer = bgzf::io::multithreaded_writer::Builder::default()
-            .set_worker_count(NonZeroUsize::new(worker_threads).unwrap())
-            .build_from_writer(file);
-        {
-            let mut writer = vcf::io::Writer::new(&mut mt_writer);
-            writer
-                .write_header(&output_header)
-                .context("failed to write VCF header")?;
-        }
+        // 4. Open output and write the header through a multithreaded bgzf
+        //    writer. If no output path was provided, run in side-effect-only
+        //    mode: workers still apply `record_callback` (so the user can
+        //    accumulate state, count, push to a channel, etc.), but no bytes
+        //    are serialized or written.
+        let mut mt_writer = match output.as_ref() {
+            Some(path) => {
+                let file = File::create(path)
+                    .with_context(|| format!("failed to create output: {}", path.display()))?;
+                let mut w = bgzf::io::multithreaded_writer::Builder::default()
+                    .set_worker_count(NonZeroUsize::new(worker_threads).unwrap())
+                    .build_from_writer(file);
+                {
+                    let mut writer = vcf::io::Writer::new(&mut w);
+                    writer
+                        .write_header(&output_header)
+                        .context("failed to write VCF header")?;
+                }
+                Some(w)
+            }
+            None => None,
+        };
+        let serialize = mt_writer.is_some();
 
         // 5. Set up channels.
         let (work_tx, work_rx) = bounded::<Window>(worker_threads * 4);
@@ -252,7 +265,7 @@ impl ParallelVariantWindowProcessor {
                         let result = process_window(
                             &mut reader,
                             &input_header,
-                            &output_header,
+                            if serialize { Some(output_header.as_ref()) } else { None },
                             &window,
                             record_callback.as_ref(),
                         );
@@ -272,9 +285,10 @@ impl ParallelVariantWindowProcessor {
                 let bytes = result.with_context(|| format!("worker failed on window {idx}"))?;
                 buffer.insert(idx, (bp, bytes));
                 while let Some((bp, bytes)) = buffer.remove(&next_idx) {
-                    mt_writer
-                        .write_all(&bytes)
-                        .context("failed to write window bytes")?;
+                    if let Some(w) = mt_writer.as_mut() {
+                        w.write_all(&bytes)
+                            .context("failed to write window bytes")?;
+                    }
                     cum_bp += bp;
                     if let Some(cb) = progress_callback.as_ref() {
                         cb(cum_bp as usize);
@@ -292,7 +306,9 @@ impl ParallelVariantWindowProcessor {
             Ok(())
         })?;
 
-        mt_writer.finish().context("failed to finalize bgzf writer")?;
+        if let Some(mut w) = mt_writer {
+            w.finish().context("failed to finalize bgzf writer")?;
+        }
         Ok(())
     }
 }
@@ -332,7 +348,7 @@ fn enumerate_windows(
 fn process_window<R>(
     reader: &mut variant::io::IndexedReader<R>,
     input_header: &vcf::Header,
-    output_header: &vcf::Header,
+    output_header: Option<&vcf::Header>,
     window: &Window,
     record_callback: &RecordCallback,
 ) -> Result<Vec<u8>>
@@ -348,28 +364,54 @@ where
         .with_context(|| format!("query failed for {}:{}-{}", window.contig, window.start, window.end))?;
 
     let mut bytes = Vec::new();
-    {
-        let mut writer = vcf::io::Writer::new(&mut bytes);
-        for result in query {
-            let record = result.context("error reading record")?;
-            // Boundary dedup: a tabix query returns any record whose span overlaps
-            // the region, so a record starting *before* this window will also be
-            // returned by the previous window. Keep it only where its POS lands.
-            let pos = match record.as_ref().variant_start() {
-                Some(r) => r.context("missing POS")?,
-                None => continue, // unplaced record; skip.
-            };
-            if (pos.get() as u64) < window.start {
-                continue;
+    match output_header {
+        Some(out_header) => {
+            let mut writer = vcf::io::Writer::new(&mut bytes);
+            for result in query {
+                let record = result.context("error reading record")?;
+                let Some(pos) = take_pos_if_in_window(record.as_ref(), window)? else {
+                    continue;
+                };
+                let _ = pos;
+                let buf = RecordBuf::try_from_variant_record(input_header, record.as_ref())
+                    .context("failed to materialize RecordBuf")?;
+                if let Some(out) = record_callback(buf) {
+                    writer
+                        .write_variant_record(out_header, &out)
+                        .context("failed to serialize record")?;
+                }
             }
-            let buf = RecordBuf::try_from_variant_record(input_header, record.as_ref())
-                .context("failed to materialize RecordBuf")?;
-            if let Some(out) = record_callback(buf) {
-                writer
-                    .write_variant_record(output_header, &out)
-                    .context("failed to serialize record")?;
+        }
+        None => {
+            // Side-effect-only mode: never allocate writer, never serialize.
+            for result in query {
+                let record = result.context("error reading record")?;
+                let Some(pos) = take_pos_if_in_window(record.as_ref(), window)? else {
+                    continue;
+                };
+                let _ = pos;
+                let buf = RecordBuf::try_from_variant_record(input_header, record.as_ref())
+                    .context("failed to materialize RecordBuf")?;
+                let _ = record_callback(buf);
             }
         }
     }
     Ok(bytes)
+}
+
+/// Boundary dedup: tabix queries return any record whose span overlaps the
+/// region, so a record starting *before* this window will also be returned by
+/// the previous window. Keep it only in the window where its POS lands.
+fn take_pos_if_in_window(
+    record: &dyn vcf::variant::Record,
+    window: &Window,
+) -> Result<Option<Position>> {
+    let pos = match record.variant_start() {
+        Some(r) => r.context("missing POS")?,
+        None => return Ok(None), // unplaced record; skip.
+    };
+    if (pos.get() as u64) < window.start {
+        return Ok(None);
+    }
+    Ok(Some(pos))
 }

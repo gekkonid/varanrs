@@ -36,7 +36,7 @@ pub fn run(args: UpperArgs) -> Result<()> {
 
     let mut builder = ParallelVariantWindowProcessor::builder()
         .input(args.input)
-        .output(args.output)
+        .with_output_file(args.output)
         .worker_threads(threads)
         .record_callback(uppercase_alleles)
         .progress_callback(|bp| {

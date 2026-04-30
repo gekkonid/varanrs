@@ -89,7 +89,7 @@ fn identity_round_trip() -> Result<()> {
 
     ParallelVariantWindowProcessor::builder()
         .input(&input)
-        .output(&output)
+        .with_output_file(&output)
         .worker_threads(4)
         .window_size(1000)
         .record_callback(Some)
@@ -110,7 +110,7 @@ fn filtering_drops_records() -> Result<()> {
 
     ParallelVariantWindowProcessor::builder()
         .input(&input)
-        .output(&output)
+        .with_output_file(&output)
         .worker_threads(4)
         .window_size(1000)
         .record_callback(|buf| {
@@ -145,7 +145,7 @@ fn header_callback_is_applied_to_output_header() -> Result<()> {
 
     ParallelVariantWindowProcessor::builder()
         .input(&input)
-        .output(&output)
+        .with_output_file(&output)
         .worker_threads(2)
         .window_size(1000)
         .record_callback(Some)
@@ -172,7 +172,7 @@ fn output_is_globally_ordered_under_parallelism() -> Result<()> {
 
     ParallelVariantWindowProcessor::builder()
         .input(&input)
-        .output(&output)
+        .with_output_file(&output)
         .worker_threads(8)
         .window_size(137) // small windows, lots of reordering
         .record_callback(Some)
@@ -208,7 +208,7 @@ fn boundary_record_is_not_duplicated() -> Result<()> {
 
     ParallelVariantWindowProcessor::builder()
         .input(&input)
-        .output(&output)
+        .with_output_file(&output)
         .worker_threads(4)
         .window_size(1000) // boundary at POS 1000/1001
         .record_callback(Some)
@@ -233,7 +233,7 @@ fn progress_callback_reports_cumulative_bp() -> Result<()> {
 
     ParallelVariantWindowProcessor::builder()
         .input(&input)
-        .output(&output)
+        .with_output_file(&output)
         .worker_threads(4)
         .window_size(1000)
         .record_callback(Some)
@@ -247,6 +247,59 @@ fn progress_callback_reports_cumulative_bp() -> Result<()> {
     // Monotonic non-decreasing.
     assert!(calls.windows(2).all(|w| w[0] <= w[1]));
     // Final value = total bp covered by all windows.
+    assert_eq!(*calls.last().unwrap(), 5000 + 3000);
+    Ok(())
+}
+
+#[test]
+fn iterates_without_writing_when_no_output_set() -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("in.vcf.gz");
+    build_simple_input(&input);
+
+    // Side-effect-only callback: count records, never write a VCF.
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_for_cb = Arc::clone(&count);
+
+    ParallelVariantWindowProcessor::builder()
+        .input(&input)
+        .worker_threads(4)
+        .window_size(1000)
+        .record_callback(move |buf| {
+            count_for_cb.fetch_add(1, Ordering::Relaxed);
+            // Returning None or Some doesn't matter — nothing is written.
+            Some(buf)
+        })
+        .run()?;
+
+    // Fixture: 30 chr1 + 10 chr2 = 40 records.
+    assert_eq!(count.load(Ordering::Relaxed), 40);
+    Ok(())
+}
+
+#[test]
+fn no_output_still_fires_progress_in_window_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("in.vcf.gz");
+    build_simple_input(&input);
+
+    let calls: std::sync::Arc<Mutex<Vec<usize>>> = Default::default();
+    let calls_for_cb = std::sync::Arc::clone(&calls);
+
+    ParallelVariantWindowProcessor::builder()
+        .input(&input)
+        .worker_threads(4)
+        .window_size(1000)
+        .record_callback(Some)
+        .progress_callback(move |bp| calls_for_cb.lock().unwrap().push(bp))
+        .run()?;
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 8);
+    assert!(calls.windows(2).all(|w| w[0] <= w[1]));
     assert_eq!(*calls.last().unwrap(), 5000 + 3000);
     Ok(())
 }
