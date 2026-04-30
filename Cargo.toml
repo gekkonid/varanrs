@@ -1,0 +1,26 @@
+[package]
+name = "pygopus"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pygopus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pygopus"
+path = "src/main.rs"
+
+[dependencies]
+noodles-util = { version = "0.78", features = ["variant"] }
+noodles-vcf = "0.87"
+noodles-bgzf = "0.46"
+noodles-core = "0.19"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+crossbeam-channel = "0.5"
+anyhow = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
