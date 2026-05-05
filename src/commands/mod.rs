@@ -1,3 +1,4 @@
-//! Subcommand modules for the `pygopus` CLI.
+//! Subcommand modules for the `varanrs` CLI.
 
+pub mod filter;
 pub mod upper;

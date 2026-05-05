@@ -16,11 +16,13 @@ use vcf::header::record::value::map::info::Number as InfoNumber;
 use vcf::variant::RecordBuf;
 use vcf::variant::record_buf::info::field::Value as InfoValue;
 use vcf::variant::record_buf::info::field::value::Array as InfoArray;
+use vcf::variant::record::Samples as _;
 use vcf::variant::record_buf::samples::Samples;
 use vcf::variant::record_buf::samples::sample::Value as SampleValue;
 use vcf::variant::record_buf::samples::sample::value::Array as SampleArray;
 use vcf::variant::record_buf::samples::sample::value::Genotype;
 use vcf::variant::record_buf::samples::sample::value::genotype::Allele;
+
 
 /// Apply minimum AC and AF thresholds independently — an allele is kept only
 /// when it satisfies *both* thresholds (when both are supplied). When neither
@@ -131,13 +133,13 @@ fn count_alleles(buf: &RecordBuf, n_total: usize) -> AlleleCounts {
     let mut allele_counts = vec![0u32; n_total];
     let mut n_called_alleles = 0u32;
     let mut n_samples_with_missing = 0u32;
-    let n_samples = samples.values().len() as u32;
+    let n_samples = samples.len() as u32;
 
     for sample in samples.values() {
         let mut sample_has_missing = false;
 
         if let Some(idx) = gt_idx {
-            match sample.get(idx).and_then(|v| v.as_ref()) {
+            match sample.values().get(idx).and_then(|v| v.as_ref()) {
                 Some(SampleValue::Genotype(g)) => {
                     for allele in g.as_ref() {
                         match allele.position() {
@@ -179,16 +181,17 @@ fn rebuild_samples(
     let keys = buf.samples().keys().clone();
     let key_list: Vec<String> = keys.as_ref().iter().cloned().collect();
     let gt_idx = keys.as_ref().get_index_of("GT");
-    let mut new_values: Vec<Vec<Option<SampleValue>>> = Vec::with_capacity(buf.samples().values().len());
+    let mut new_values: Vec<Vec<Option<SampleValue>>> = Vec::with_capacity(buf.samples().len());
 
     for row in buf.samples().values() {
+        let row_values = row.values();
         // Decide whether this sample's GT references any removed allele.
-        let (gt_lost, ploidy) = inspect_genotype(row, gt_idx, remap);
+        let (gt_lost, ploidy) = inspect_genotype(row_values, gt_idx, remap);
 
         if gt_lost {
             // Set everything to missing for this sample, preserving ploidy on GT.
-            let mut new_row = Vec::with_capacity(row.len());
-            for (i, _) in row.iter().enumerate() {
+            let mut new_row = Vec::with_capacity(row_values.len());
+            for (i, _) in row_values.iter().enumerate() {
                 if Some(i) == gt_idx {
                     let missing = (0..ploidy)
                         .map(|_| Allele::new(None, vcf::variant::record::samples::series::value::genotype::Phasing::Unphased))
@@ -205,8 +208,8 @@ fn rebuild_samples(
         }
 
         // Otherwise: remap GT alleles, slice A/R/G arrays per FORMAT field.
-        let mut new_row: Vec<Option<SampleValue>> = Vec::with_capacity(row.len());
-        for (i, cell) in row.iter().enumerate() {
+        let mut new_row: Vec<Option<SampleValue>> = Vec::with_capacity(row_values.len());
+        for (i, cell) in row_values.iter().enumerate() {
             if Some(i) == gt_idx {
                 new_row.push(remap_genotype_cell(cell, remap));
                 continue;

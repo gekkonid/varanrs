@@ -13,12 +13,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Per-site allele filtering by minimum AC and/or AF.
+    Filter(commands::filter::FilterArgs),
     /// Force REF and ALT alleles to uppercase (GLnexus workaround).
     Upper(commands::upper::UpperArgs),
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Filter(args) => commands::filter::run(args),
         Command::Upper(args) => commands::upper::run(args),
     }
 }
