@@ -1,11 +1,11 @@
-//! pygopus CLI entrypoint. Git-style subcommands.
+//! varanrs CLI entrypoint. Git-style subcommands.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use pygopus::commands;
+use varanrs::commands;
 
 #[derive(Parser, Debug)]
-#[command(name = "pygopus", about = "Bioinformatics toolkit", version)]
+#[command(name = "varanrs", about = "Bioinformatics toolkit", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

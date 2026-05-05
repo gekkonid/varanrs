@@ -46,13 +46,13 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
 ";
     write_indexed_vcf(&input, text);
 
-    let args = pygopus::commands::upper::UpperArgs {
+    let args = varanrs::commands::upper::UpperArgs {
         input: input.clone(),
         output: output.clone(),
         threads: Some(2),
         window_size: Some(1000),
     };
-    pygopus::commands::upper::run(args)?;
+    varanrs::commands::upper::run(args)?;
 
     let mut reader = variant::io::reader::Builder::default().build_from_path(&output)?;
     let header = reader.read_header()?;

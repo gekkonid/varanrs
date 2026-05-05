@@ -321,7 +321,7 @@ fn enumerate_windows(
     let mut out = Vec::new();
     for (contig, map) in header.contigs().iter() {
         let Some(length) = map.length() else {
-            eprintln!("pygopus: contig {contig} has no length in header; skipping");
+            eprintln!("varanrs: contig {contig} has no length in header; skipping");
             continue;
         };
         if let Some(set) = indexed_contigs {

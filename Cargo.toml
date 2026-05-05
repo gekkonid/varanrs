@@ -1,14 +1,14 @@
 [package]
-name = "pygopus"
+name = "varanrs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
-name = "pygopus"
+name = "varanrs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pygopus"
+name = "varanrs"
 path = "src/main.rs"
 
 [dependencies]

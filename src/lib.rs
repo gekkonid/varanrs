@@ -1,8 +1,8 @@
-//! pygopus — bioinformatics toolkit library.
+//! varanrs -- VCF/BCF maniupulation in Rust
 //!
 //! Exposes the parallel variant processor (`processor::ParallelVariantWindowProcessor`)
-//! and per-record helpers (`util`).
 
 pub mod commands;
+pub mod filter;
 pub mod processor;
 pub mod util;

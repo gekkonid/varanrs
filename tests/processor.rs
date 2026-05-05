@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use noodles_util::variant;
 use noodles_vcf as vcf;
-use pygopus::processor::ParallelVariantWindowProcessor;
+use varanrs::processor::ParallelVariantWindowProcessor;
 
 /// Create a real `.vcf.gz` (bgzipped + tabix-indexed) at `path`.
 ///
