@@ -111,6 +111,8 @@ pub fn run(args: SketchArgs) -> Result<()> {
         .record_callback(record_callback)
         .progress_callback(|bp| {
             eprint!("\r  {} Mbp sampled", bp / 1_000_000);
+            use std::io::Write as _;
+            std::io::stderr().flush().ok();
         });
 
     if !args.indexed.contig.is_empty() {

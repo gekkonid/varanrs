@@ -33,6 +33,8 @@ pub fn run(args: UpperArgs) -> Result<()> {
         .record_callback(uppercase_alleles)
         .progress_callback(|bp| {
             eprint!("\r  {} Mbp processed", bp / 1_000_000);
+            use std::io::Write as _;
+            std::io::stderr().flush().ok();
         });
 
     if let Some(ws) = args.window_size {

@@ -222,6 +222,8 @@ impl ParallelVariantWindowProcessor {
         // 3. Enumerate windows from the input header's contigs.
         let windows = enumerate_windows(&input_header, window_size, stride, indexed_contigs.as_ref(), contig_filter.as_ref(), contig_lengths.as_ref());
 
+        eprintln!("varanrs: {} windows to process (stride={}, chunk={}bp)", windows.len(), stride, window_size);
+
         // 4. Open output and write the header through a multithreaded bgzf
         //    writer. If no output path was provided, run in side-effect-only
         //    mode: workers still apply `record_callback` (so the user can
