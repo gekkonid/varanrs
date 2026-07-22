@@ -8,7 +8,7 @@
 //! `bgzf::MultithreadedWriter` so the output is correctly ordered and
 //! bgzf-compressed in parallel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write as _;
 use std::num::NonZeroUsize;
@@ -53,6 +53,8 @@ pub struct ParallelVariantWindowProcessorBuilder {
     output: Option<PathBuf>,
     worker_threads: Option<usize>,
     window_size: Option<u64>,
+    stride: Option<usize>,
+    contig_filter: Option<HashSet<String>>,
     record_callback: Option<Arc<RecordCallback>>,
     header_callback: Option<HeaderCallback>,
     progress_callback: Option<Arc<ProgressCallback>>,
@@ -79,6 +81,18 @@ impl ParallelVariantWindowProcessorBuilder {
 
     pub fn window_size(mut self, bp: u64) -> Self {
         self.window_size = Some(bp);
+        self
+    }
+
+    /// Process every Nth window. Default 1 (process all windows).
+    pub fn stride(mut self, n: usize) -> Self {
+        self.stride = Some(n);
+        self
+    }
+
+    /// Limit processing to the given contig(s). When omitted, all contigs are processed.
+    pub fn contigs(mut self, contigs: Vec<String>) -> Self {
+        self.contig_filter = Some(contigs.into_iter().collect());
         self
     }
 
@@ -118,6 +132,7 @@ impl ParallelVariantWindowProcessorBuilder {
             .ok_or_else(|| anyhow!("missing worker_threads"))?
             .max(1);
         let window_size = self.window_size.unwrap_or(DEFAULT_WINDOW_SIZE).max(1);
+        let stride = self.stride.unwrap_or(1).max(1);
         let record_callback = self
             .record_callback
             .ok_or_else(|| anyhow!("missing record_callback"))?;
@@ -127,6 +142,8 @@ impl ParallelVariantWindowProcessorBuilder {
             output: self.output,
             worker_threads,
             window_size,
+            stride,
+            contig_filter: self.contig_filter,
             record_callback,
             header_callback: self.header_callback,
             progress_callback: self.progress_callback,
@@ -140,6 +157,8 @@ pub struct ParallelVariantWindowProcessor {
     output: Option<PathBuf>,
     worker_threads: usize,
     window_size: u64,
+    stride: usize,
+    contig_filter: Option<HashSet<String>>,
     record_callback: Arc<RecordCallback>,
     header_callback: Option<HeaderCallback>,
     progress_callback: Option<Arc<ProgressCallback>>,
@@ -156,6 +175,8 @@ impl ParallelVariantWindowProcessor {
             output,
             worker_threads,
             window_size,
+            stride,
+            contig_filter,
             record_callback,
             header_callback,
             progress_callback,
@@ -185,7 +206,7 @@ impl ParallelVariantWindowProcessor {
         let output_header = Arc::new(output_header);
 
         // 3. Enumerate windows from the input header's contigs.
-        let windows = enumerate_windows(&input_header, window_size, indexed_contigs.as_ref());
+        let windows = enumerate_windows(&input_header, window_size, stride, indexed_contigs.as_ref(), contig_filter.as_ref());
 
         // 4. Open output and write the header through a multithreaded bgzf
         //    writer. If no output path was provided, run in side-effect-only
@@ -316,29 +337,40 @@ impl ParallelVariantWindowProcessor {
 fn enumerate_windows(
     header: &vcf::Header,
     window_size: u64,
-    indexed_contigs: Option<&std::collections::HashSet<Vec<u8>>>,
+    stride: usize,
+    indexed_contigs: Option<&HashSet<Vec<u8>>>,
+    contig_filter: Option<&HashSet<String>>,
 ) -> Vec<Window> {
     let mut out = Vec::new();
+    let mut abs_idx = 0usize;
     for (contig, map) in header.contigs().iter() {
+        if let Some(filter) = contig_filter
+            && !filter.contains(contig.as_str())
+        {
+            continue;
+        }
         let Some(length) = map.length() else {
             eprintln!("varanrs: contig {contig} has no length in header; skipping");
             continue;
         };
-        if let Some(set) = indexed_contigs {
-            if !set.contains(contig.as_bytes()) {
-                continue;
-            }
+        if let Some(set) = indexed_contigs
+            && !set.contains(contig.as_bytes())
+        {
+            continue;
         }
         let length = length as u64;
         let mut start = 1u64;
         while start <= length {
             let end = (start + window_size - 1).min(length);
-            out.push(Window {
-                idx: out.len(),
-                contig: Box::from(contig.as_str()),
-                start,
-                end,
-            });
+            if abs_idx.is_multiple_of(stride) {
+                out.push(Window {
+                    idx: out.len(),
+                    contig: Box::from(contig.as_str()),
+                    start,
+                    end,
+                });
+            }
+            abs_idx += 1;
             start = end + 1;
         }
     }

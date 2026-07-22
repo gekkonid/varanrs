@@ -15,6 +15,8 @@ struct Cli {
 enum Command {
     /// Per-site allele filtering by minimum AC and/or AF.
     Filter(commands::filter::FilterArgs),
+    /// Subsample an indexed VCF/BCF, estimate pairwise distances and per-sample missingness.
+    Snpsketch(commands::snpsketch::SketchArgs),
     /// Force REF and ALT alleles to uppercase (GLnexus workaround).
     Upper(commands::upper::UpperArgs),
 }
@@ -22,6 +24,7 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Filter(args) => commands::filter::run(args),
+        Command::Snpsketch(args) => commands::snpsketch::run(args),
         Command::Upper(args) => commands::upper::run(args),
     }
 }
