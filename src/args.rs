@@ -8,8 +8,9 @@ use indexmap::IndexMap;
 #[derive(Args, Debug)]
 pub struct IndexedInput {
     /// Variant file (must be indexed: vcf.gz+tbi or bcf+csi).
+    /// Reads stdin when omitted or set to "-".
     #[arg()]
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
 
     /// Worker thread count. Defaults to system parallelism.
     #[arg(long)]

@@ -48,12 +48,12 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
 
     let args = varanrs::commands::upper::UpperArgs {
         indexed: varanrs::args::IndexedInput {
-            input: input.clone(),
+            input: Some(input.clone()),
             threads: Some(2),
             contig: vec![],
             fai: None,
         },
-        output: output.clone(),
+        output: Some(output.display().to_string()),
         window_size: Some(1000),
     };
     varanrs::commands::upper::run(args)?;
@@ -72,5 +72,81 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
         count += 1;
     }
     assert_eq!(count, 5);
+    Ok(())
+}
+
+fn varanrs_binary() -> String {
+    std::env::var("CARGO_BIN_EXE_varanrs").unwrap_or_else(|_| "target/debug/varanrs".into())
+}
+
+#[test]
+fn stdin_stdout_upper_identity() -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let vcf = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chr1\t100\t.\ta\tt\t.\t.\t.\tGT\t0/1
+chr1\t200\t.\tc\tG,a\t.\t.\t.\tGT\t1/2
+";
+
+    let mut child = Command::new(varanrs_binary())
+        .arg("upper")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    child.stdin.take().unwrap().write_all(vcf.as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("chr1\t100\t.\tA\tT"), "REF/ALT should be uppercased");
+    assert!(out.contains("chr1\t200\t.\tC\tG,A"), "multi-allelic should be uppercased");
+    Ok(())
+}
+
+#[test]
+fn stdin_upper_from_bcf_pipe() -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    if !Command::new("bcftools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        eprintln!("SKIP: bcftools not available");
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let vcf_path = dir.path().join("in.vcf");
+    std::fs::write(&vcf_path, "\
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chr1\t100\t.\ta\tt\t.\t.\t.\tGT\t0/1
+")?;
+
+    let bcf_path = dir.path().join("in.bcf");
+    assert!(Command::new("bcftools")
+        .args(["convert", "-O", "b", "-o"])
+        .arg(&bcf_path).arg(&vcf_path)
+        .status()?.success());
+
+    let producer = Command::new("bcftools")
+        .args(["view", "-Ou"])
+        .arg(&bcf_path)
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let consumer = Command::new(varanrs_binary())
+        .arg("upper")
+        .stdin(producer.stdout.unwrap())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let output = consumer.wait_with_output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("A\tT"), "uncompressed BCF pipe should uppercase alleles");
     Ok(())
 }

@@ -7,8 +7,8 @@ use anyhow::Result;
 
 fn run_filter(input: &Path, output: &Path, min_ac: Option<u32>, min_af: Option<f64>) -> Result<()> {
     let args = varanrs::commands::filter::FilterArgs {
-        input: input.into(),
-        output: output.into(),
+        input: Some(input.display().to_string()),
+        output: Some(output.display().to_string()),
         min_ac,
         min_af,
     };
@@ -293,5 +293,109 @@ chr1\t100\t.\tA\tC\t.\t.\tAN=6;AC=3;AF=0.5;F_MISSING=0.25\tGT\t0/1\t./.\t1/1\t0/
 chr1\t300\t.\tT\tC\t.\t.\tAN=8;AC=8;AF=1;F_MISSING=0\tGT\t1/1\t1/1\t1/1\t1/1\n";
 
     assert_eq!(out, expected, "output VCF mismatch");
+    Ok(())
+}
+
+fn varanrs_binary() -> String {
+    std::env::var("CARGO_BIN_EXE_varanrs").unwrap_or_else(|_| "target/debug/varanrs".into())
+}
+
+#[test]
+fn stdin_stdout_filter_identity() -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let vcf = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1
+chr1\t200\t.\tG\tC\t.\t.\t.\tGT\t0/0
+";
+
+    let mut child = Command::new(varanrs_binary())
+        .arg("filter")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    child.stdin.take().unwrap().write_all(vcf.as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("chr1\t100"));
+    assert!(out.contains("chr1\t200"));
+    Ok(())
+}
+
+#[test]
+fn stdin_stdout_filter_min_ac() -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let vcf = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1\t0/0
+chr1\t200\t.\tG\tC\t.\t.\t.\tGT\t1/1\t0/1
+";
+
+    let mut child = Command::new(varanrs_binary())
+        .args(["filter", "--min-ac", "3"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    child.stdin.take().unwrap().write_all(vcf.as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(!out.contains("chr1\t100"), "low-AC should be filtered");
+    assert!(out.contains("chr1\t200"), "high-AC should be kept");
+    Ok(())
+}
+
+#[test]
+fn stdin_filter_from_bcf_pipe() -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    if !Command::new("bcftools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        eprintln!("SKIP: bcftools not available");
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let vcf_path = dir.path().join("in.vcf");
+    std::fs::write(&vcf_path, "\
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1
+")?;
+
+    let bcf_path = dir.path().join("in.bcf");
+    assert!(Command::new("bcftools")
+        .args(["convert", "-O", "b", "-o"])
+        .arg(&bcf_path).arg(&vcf_path)
+        .status()?.success());
+
+    let producer = Command::new("bcftools")
+        .args(["view", "-Ou"])
+        .arg(&bcf_path)
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let consumer = Command::new(varanrs_binary())
+        .arg("filter")
+        .stdin(producer.stdout.unwrap())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let output = consumer.wait_with_output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("chr1\t100"), "record should survive filter on BCF pipe");
     Ok(())
 }

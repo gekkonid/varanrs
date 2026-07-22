@@ -35,7 +35,8 @@ pub struct SketchArgs {
 }
 
 pub fn run(args: SketchArgs) -> Result<()> {
-    let input = &args.indexed.input;
+    let input = args.indexed.input.as_ref()
+        .ok_or_else(|| anyhow!("snpsketch requires an indexed input file"))?;
 
     let mut reader = variant::io::indexed_reader::Builder::default()
         .build_from_path(input)
