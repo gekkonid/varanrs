@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::Result;
 use bitvec::order::Lsb0;
 use bitvec::vec::BitVec;
+use indexmap::IndexMap;
 use noodles_vcf as vcf;
 use vcf::variant::record_buf::samples::sample::Value as SampleValue;
 use vcf::variant::RecordBuf;
@@ -12,14 +12,14 @@ pub struct SketchAccumulator {
     pub sample_ids: Vec<String>,
     pub n_sites: usize,
     positions: Vec<(u32, u32)>,
-    contig_rank: HashMap<String, usize>,
+    contig_rank: IndexMap<String, usize>,
     calls: Vec<BitVec<u64, Lsb0>>,
     any_alt: Vec<BitVec<u64, Lsb0>>,
     hom_alt: Vec<BitVec<u64, Lsb0>>,
 }
 
 impl SketchAccumulator {
-    pub fn new(sample_ids: Vec<String>, contig_rank: HashMap<String, usize>) -> Self {
+    pub fn new(sample_ids: Vec<String>, contig_rank: IndexMap<String, usize>) -> Self {
         let n = sample_ids.len();
         Self {
             sample_ids,

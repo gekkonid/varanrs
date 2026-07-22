@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::io::Cursor;
 
+use indexmap::IndexMap;
 use noodles_vcf as vcf;
 use vcf::variant::RecordBuf;
 
@@ -21,7 +21,7 @@ fn parse_vcf_text(vcf_text: &str) -> (vcf::Header, Vec<RecordBuf>) {
 fn make_acc_from_vcf(vcf_text: &str) -> SketchAccumulator {
     let (header, records) = parse_vcf_text(vcf_text);
     let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: HashMap<String, usize> = header
+    let contig_rank: IndexMap<String, usize> = header
         .contigs()
         .iter()
         .enumerate()
@@ -36,7 +36,7 @@ fn make_acc_from_vcf(vcf_text: &str) -> SketchAccumulator {
 
 #[test]
 fn smoke_empty_sample_set_errors_gracefully() {
-    let acc = SketchAccumulator::new(vec![], HashMap::new());
+    let acc = SketchAccumulator::new(vec![], IndexMap::new());
     assert_eq!(acc.n_samples(), 0);
     assert_eq!(acc.n_sites, 0);
 
@@ -49,7 +49,7 @@ fn smoke_empty_sample_set_errors_gracefully() {
 
 #[test]
 fn single_sample_no_pairs() {
-    let acc = SketchAccumulator::new(vec!["S1".to_string()], HashMap::new());
+    let acc = SketchAccumulator::new(vec!["S1".to_string()], IndexMap::new());
     let mut csv = Cursor::new(Vec::new());
     acc.write_pairs_csv(&mut csv).unwrap();
     let output = String::from_utf8(csv.into_inner()).unwrap();
@@ -68,7 +68,7 @@ chr1	100	.	A	G	.	.	.	GT	0/0	0/1	1/1	./.
 
     let (header, records) = parse_vcf_text(vcf);
     let ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: HashMap<String, usize> = header
+    let contig_rank: IndexMap<String, usize> = header
         .contigs()
         .iter()
         .enumerate()
@@ -341,7 +341,7 @@ chr1	300	.	G	A	.	.	.	GT	./.	1/1
 
 #[test]
 fn computes_across_zero_sites() {
-    let acc = SketchAccumulator::new(vec!["S1".to_string(), "S2".to_string()], HashMap::new());
+    let acc = SketchAccumulator::new(vec!["S1".to_string(), "S2".to_string()], IndexMap::new());
     let (_n_diff, n_common, distance) = acc.compute_pair_stats(0, 1);
     assert_eq!(n_common, 0);
     assert!(distance.is_nan());

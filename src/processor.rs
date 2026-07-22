@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
+use indexmap::IndexMap;
 use noodles_bgzf as bgzf;
 use noodles_core::{Position, Region};
 use noodles_util::variant;
@@ -55,6 +56,7 @@ pub struct ParallelVariantWindowProcessorBuilder {
     window_size: Option<u64>,
     stride: Option<usize>,
     contig_filter: Option<HashSet<String>>,
+    contig_lengths: Option<IndexMap<String, u64>>,
     record_callback: Option<Arc<RecordCallback>>,
     header_callback: Option<HeaderCallback>,
     progress_callback: Option<Arc<ProgressCallback>>,
@@ -93,6 +95,15 @@ impl ParallelVariantWindowProcessorBuilder {
     /// Limit processing to the given contig(s). When omitted, all contigs are processed.
     pub fn contigs(mut self, contigs: Vec<String>) -> Self {
         self.contig_filter = Some(contigs.into_iter().collect());
+        self
+    }
+
+    /// Supply contig name -> length pairs from an external source (e.g. .fai).
+    /// These are used as fallback lengths for contigs that lack length info in
+    /// the VCF header, and as a source of additional contigs not listed in the
+    /// header.
+    pub fn contig_lengths(mut self, lengths: IndexMap<String, u64>) -> Self {
+        self.contig_lengths = Some(lengths);
         self
     }
 
@@ -144,6 +155,7 @@ impl ParallelVariantWindowProcessorBuilder {
             window_size,
             stride,
             contig_filter: self.contig_filter,
+            contig_lengths: self.contig_lengths,
             record_callback,
             header_callback: self.header_callback,
             progress_callback: self.progress_callback,
@@ -159,6 +171,7 @@ pub struct ParallelVariantWindowProcessor {
     window_size: u64,
     stride: usize,
     contig_filter: Option<HashSet<String>>,
+    contig_lengths: Option<IndexMap<String, u64>>,
     record_callback: Arc<RecordCallback>,
     header_callback: Option<HeaderCallback>,
     progress_callback: Option<Arc<ProgressCallback>>,
@@ -177,6 +190,7 @@ impl ParallelVariantWindowProcessor {
             window_size,
             stride,
             contig_filter,
+            contig_lengths,
             record_callback,
             header_callback,
             progress_callback,
@@ -206,7 +220,7 @@ impl ParallelVariantWindowProcessor {
         let output_header = Arc::new(output_header);
 
         // 3. Enumerate windows from the input header's contigs.
-        let windows = enumerate_windows(&input_header, window_size, stride, indexed_contigs.as_ref(), contig_filter.as_ref());
+        let windows = enumerate_windows(&input_header, window_size, stride, indexed_contigs.as_ref(), contig_filter.as_ref(), contig_lengths.as_ref());
 
         // 4. Open output and write the header through a multithreaded bgzf
         //    writer. If no output path was provided, run in side-effect-only
@@ -340,25 +354,52 @@ fn enumerate_windows(
     stride: usize,
     indexed_contigs: Option<&HashSet<Vec<u8>>>,
     contig_filter: Option<&HashSet<String>>,
+    contig_lengths: Option<&IndexMap<String, u64>>,
 ) -> Vec<Window> {
     let mut out = Vec::new();
     let mut abs_idx = 0usize;
+
+    let header_contig_names: HashSet<&str> =
+        header.contigs().iter().map(|(n, _)| n.as_str()).collect();
+
+    // Build ordered list of (name, length). Header contigs come first in header
+    // order; then contigs from contig_lengths not in the header, in their
+    // insertion order.
+    let mut ordered: Vec<(String, u64)> = Vec::new();
     for (contig, map) in header.contigs().iter() {
+        let length = map
+            .length()
+            .or_else(|| {
+                contig_lengths
+                    .and_then(|cl| cl.get(contig.as_str()).copied())
+                    .and_then(|l| usize::try_from(l).ok())
+            });
+        if let Some(len) = length {
+            ordered.push((contig.to_string(), len as u64));
+        } else {
+            eprintln!("varanrs: contig {contig} has no length in header or fai; skipping");
+        }
+    }
+    if let Some(cl) = contig_lengths {
+        for (name, len) in cl {
+            if !header_contig_names.contains(name.as_str()) {
+                ordered.push((name.clone(), *len));
+            }
+        }
+    }
+
+    for (contig, length) in &ordered {
         if let Some(filter) = contig_filter
             && !filter.contains(contig.as_str())
         {
             continue;
         }
-        let Some(length) = map.length() else {
-            eprintln!("varanrs: contig {contig} has no length in header; skipping");
-            continue;
-        };
         if let Some(set) = indexed_contigs
             && !set.contains(contig.as_bytes())
         {
             continue;
         }
-        let length = length as u64;
+        let length = *length;
         let mut start = 1u64;
         while start <= length {
             let end = (start + window_size - 1).min(length);

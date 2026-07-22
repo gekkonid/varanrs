@@ -2,6 +2,7 @@
 //!
 //! Exposes the parallel variant processor (`processor::ParallelVariantWindowProcessor`)
 
+pub mod args;
 pub mod commands;
 pub mod filter;
 pub mod processor;

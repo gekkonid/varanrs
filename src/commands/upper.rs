@@ -5,22 +5,18 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 
+use crate::args::{self, IndexedInput};
 use crate::processor::ParallelVariantWindowProcessor;
 use crate::util::uppercase_alleles;
 
 #[derive(Args, Debug)]
 pub struct UpperArgs {
-    /// Input variant file (must be indexed: vcf.gz+tbi or bcf+csi).
-    #[arg(long)]
-    pub input: PathBuf,
+    #[command(flatten)]
+    pub indexed: IndexedInput,
 
     /// Output vcf.gz path.
     #[arg(long)]
     pub output: PathBuf,
-
-    /// Worker thread count. Defaults to the system parallelism.
-    #[arg(long)]
-    pub threads: Option<usize>,
 
     /// Window size in base pairs. Defaults to 1 Mbp.
     #[arg(long)]
@@ -28,14 +24,10 @@ pub struct UpperArgs {
 }
 
 pub fn run(args: UpperArgs) -> Result<()> {
-    let threads = args.threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-    });
+    let threads = args.indexed.resolve_threads();
 
     let mut builder = ParallelVariantWindowProcessor::builder()
-        .input(args.input)
+        .input(args.indexed.input)
         .with_output_file(args.output)
         .worker_threads(threads)
         .record_callback(uppercase_alleles)
@@ -47,7 +39,16 @@ pub fn run(args: UpperArgs) -> Result<()> {
         builder = builder.window_size(ws);
     }
 
+    if !args.indexed.contig.is_empty() {
+        builder = builder.contigs(args.indexed.contig);
+    }
+
+    if let Some(ref fai_path) = args.indexed.fai {
+        let fai = args::parse_fai(fai_path)?;
+        builder = builder.contig_lengths(fai.lengths);
+    }
+
     let result = builder.run();
-    eprintln!(); // newline after the in-place progress line.
+    eprintln!();
     result
 }

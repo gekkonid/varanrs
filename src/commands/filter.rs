@@ -12,11 +12,11 @@ use crate::filter::filter_alleles_at_site;
 #[derive(Args, Debug)]
 pub struct FilterArgs {
     /// Input VCF/BCF path.
-    #[arg(long)]
+    #[arg()]
     pub input: PathBuf,
 
     /// Output VCF path.
-    #[arg(long)]
+    #[arg(long = "output", short = 'o')]
     pub output: PathBuf,
 
     /// Minimum allele count (inclusive).

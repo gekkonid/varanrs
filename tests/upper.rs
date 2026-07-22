@@ -47,9 +47,13 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
     write_indexed_vcf(&input, text);
 
     let args = varanrs::commands::upper::UpperArgs {
-        input: input.clone(),
+        indexed: varanrs::args::IndexedInput {
+            input: input.clone(),
+            threads: Some(2),
+            contig: vec![],
+            fai: None,
+        },
         output: output.clone(),
-        threads: Some(2),
         window_size: Some(1000),
     };
     varanrs::commands::upper::run(args)?;
