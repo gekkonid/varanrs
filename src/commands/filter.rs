@@ -33,9 +33,10 @@ pub fn run(args: FilterArgs) -> Result<()> {
         .build_from_path(&args.input)
         .with_context(|| format!("failed to open input: {}", args.input.display()))?;
 
-    let header = reader
+    let mut header = reader
         .read_header()
         .with_context(|| "failed to read VCF header")?;
+    crate::util::normalize_header_for_noodles(&mut header);
 
     let mut writer = vcf::io::Writer::new(
         std::fs::File::create(&args.output)

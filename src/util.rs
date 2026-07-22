@@ -1,6 +1,7 @@
 //! Per-record utility callbacks suitable for `ParallelVariantWindowProcessor`.
 
-use noodles_vcf::variant::RecordBuf;
+use noodles_vcf as vcf;
+use vcf::variant::RecordBuf;
 
 /// Force REF and ALT alleles to ASCII-uppercase. Workaround for GLnexus, which
 /// occasionally emits lowercase allele characters that downstream tools reject.
@@ -10,6 +11,36 @@ pub fn uppercase_alleles(mut buf: RecordBuf) -> Option<RecordBuf> {
         alt.make_ascii_uppercase();
     }
     Some(buf)
+}
+
+/// Work around a GLnexus header bug: it declares `RNC` as `Type=Character,
+/// Number=2` but actually encodes it as a single string like `"II"`.  Patching
+/// the header to `Type=String, Number=1` lets noodles parse the records.
+pub fn normalize_header_for_noodles(header: &mut vcf::Header) {
+    use vcf::header::record::value::{Map, map::Format};
+    use vcf::header::record::value::map::format::{Number, Type};
+
+    if header.formats().contains_key("RNC") {
+        header.formats_mut().insert(
+            String::from("RNC"),
+            Map::<Format>::new(Number::Count(1), Type::String, "Reason for No Call"),
+        );
+    }
+}
+
+pub fn human_bp(bp: u64) -> (f64, &'static str) {
+    const KB: f64 = 1_000.0;
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    if bp as f64 >= GB {
+        (bp as f64 / GB, "Gbp")
+    } else if bp as f64 >= MB {
+        (bp as f64 / MB, "Mbp")
+    } else if bp as f64 >= KB {
+        (bp as f64 / KB, "kbp")
+    } else {
+        (bp as f64, "bp")
+    }
 }
 
 #[cfg(test)]
@@ -58,5 +89,22 @@ mod tests {
         let buf = uppercase_alleles(record("n", &["a"])).unwrap();
         assert_eq!(buf.reference_bases(), "N");
         assert_eq!(buf.alternate_bases().as_ref(), &["A".to_string()]);
+    }
+
+    #[test]
+    fn normalize_header_fixes_rnc_type() {
+        let mut header = vcf::Header::default();
+        use vcf::header::record::value::{Map, map::Format};
+        use vcf::header::record::value::map::format::{Number, Type};
+        header.formats_mut().insert(
+            String::from("RNC"),
+            Map::<Format>::new(Number::Count(2), Type::Character, "Reason for No Call"),
+        );
+
+        normalize_header_for_noodles(&mut header);
+
+        let rnc = header.formats().get("RNC").unwrap();
+        assert_eq!(rnc.number(), Number::Count(1));
+        assert_eq!(rnc.ty(), Type::String);
     }
 }

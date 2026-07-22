@@ -42,8 +42,9 @@ fn read_records(path: &Path) -> Vec<(String, usize, String, Vec<String>)> {
     let header = reader.read_header().unwrap();
     let mut out = Vec::new();
     for r in reader.records(&header) {
-        let r = r.unwrap();
-        let buf = vcf::variant::RecordBuf::try_from_variant_record(&header, r.as_ref()).unwrap();
+        let r = r.unwrap_or_else(|e| panic!("{path:?}: read error: {e}"));
+        let buf = vcf::variant::RecordBuf::try_from_variant_record(&header, r.as_ref())
+            .unwrap_or_else(|e| panic!("{path:?}: record conversion failed: {e}"));
         let chrom = buf.reference_sequence_name().to_string();
         let pos = buf.variant_start().unwrap().get();
         let reference = buf.reference_bases().to_string();
@@ -228,7 +229,7 @@ fn progress_callback_reports_cumulative_bp() -> Result<()> {
     let output = dir.path().join("out.vcf.gz");
     build_simple_input(&input);
 
-    let calls: std::sync::Arc<Mutex<Vec<usize>>> = Default::default();
+    let calls: std::sync::Arc<Mutex<Vec<u64>>> = Default::default();
     let calls_for_cb = std::sync::Arc::clone(&calls);
 
     ParallelVariantWindowProcessor::builder()
@@ -237,7 +238,7 @@ fn progress_callback_reports_cumulative_bp() -> Result<()> {
         .worker_threads(4)
         .window_size(1000)
         .record_callback(Some)
-        .progress_callback(move |bp| calls_for_cb.lock().unwrap().push(bp))
+        .progress_callback(move |bp, _, _| calls_for_cb.lock().unwrap().push(bp))
         .run()?;
 
     let calls = calls.lock().unwrap().clone();
@@ -286,7 +287,7 @@ fn no_output_still_fires_progress_in_window_order() -> Result<()> {
     let input = dir.path().join("in.vcf.gz");
     build_simple_input(&input);
 
-    let calls: std::sync::Arc<Mutex<Vec<usize>>> = Default::default();
+    let calls: std::sync::Arc<Mutex<Vec<u64>>> = Default::default();
     let calls_for_cb = std::sync::Arc::clone(&calls);
 
     ParallelVariantWindowProcessor::builder()
@@ -294,12 +295,159 @@ fn no_output_still_fires_progress_in_window_order() -> Result<()> {
         .worker_threads(4)
         .window_size(1000)
         .record_callback(Some)
-        .progress_callback(move |bp| calls_for_cb.lock().unwrap().push(bp))
+        .progress_callback(move |bp, _, _| calls_for_cb.lock().unwrap().push(bp))
         .run()?;
 
     let calls = calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 8);
     assert!(calls.windows(2).all(|w| w[0] <= w[1]));
     assert_eq!(*calls.last().unwrap(), 5000 + 3000);
+    Ok(())
+}
+
+fn write_indexed_bcf(path: &Path, vcf_gz_path: &Path) {
+    let status = std::process::Command::new("bcftools")
+        .args(["convert", "-O", "b", "-o"])
+        .arg(path)
+        .arg(vcf_gz_path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "bcftools convert failed");
+
+    let status = std::process::Command::new("bcftools")
+        .args(["index"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "bcftools index failed");
+}
+
+#[test]
+fn identity_round_trip_with_symbolic_alleles() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let input_gz = dir.path().join("in.vcf.gz");
+    let output_gz = dir.path().join("out.vcf.gz");
+    let input_bcf = dir.path().join("in.bcf");
+    let output_bcf = dir.path().join("out.bcf.vcf.gz");
+
+    let text = "\
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10000>
+##ALT=<ID=DEL,Description=\"Deletion\">
+##ALT=<ID=DUP,Description=\"Duplication\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2
+chr1\t100\t.\tA\tG\t.\t.\t.\tGT\t0/1\t1/1
+chr1\t200\t.\tC\tT\t.\t.\t.\tGT\t0/0\t0/1
+chr1\t300\t.\tT\t<DEL>\t.\t.\t.\tGT\t0/1\t1/1
+chr1\t400\t.\tG\tA\t.\t.\t.\tGT\t1/1\t0/0
+chr1\t500\t.\tA\t<DUP>\t.\t.\t.\tGT\t0/1\t0/1
+chr1\t600\t.\tC\tG\t.\t.\t.\tGT\t0/0\t0/0
+chr1\t700\t.\tT\tC,A\t.\t.\t.\tGT\t0/1\t1/2
+";
+
+    // VCF.gz round-trip
+    write_indexed_vcf(&input_gz, text);
+    ParallelVariantWindowProcessor::builder()
+        .input(&input_gz)
+        .with_output_file(&output_gz)
+        .worker_threads(2)
+        .window_size(5000)
+        .record_callback(Some)
+        .run()?;
+
+    let before = read_records(&input_gz);
+    let after = read_records(&output_gz);
+    assert_eq!(before, after, "VCF.gz round-trip with symbolic alleles");
+    assert_eq!(before.len(), 7);
+
+    // BCF round-trip
+    write_indexed_bcf(&input_bcf, &input_gz);
+    ParallelVariantWindowProcessor::builder()
+        .input(&input_bcf)
+        .with_output_file(&output_bcf)
+        .worker_threads(2)
+        .window_size(5000)
+        .record_callback(Some)
+        .run()?;
+
+    let before_bcf = read_records(&output_bcf);
+    assert_eq!(before_bcf.len(), before.len(),
+        "BCF round-trip with symbolic alleles: record count");
+
+    for (i, ((orig_chr, orig_pos, orig_ref, orig_alts), (bcf_chr, bcf_pos, bcf_ref, bcf_alts))) in
+        before.iter().zip(before_bcf.iter()).enumerate()
+    {
+        assert_eq!(orig_chr, bcf_chr, "record {i}: chrom mismatch");
+        assert_eq!(orig_pos, bcf_pos, "record {i}: pos mismatch");
+        assert_eq!(orig_ref, bcf_ref, "record {i}: ref mismatch");
+        assert_eq!(orig_alts, bcf_alts, "record {i}: alt mismatch");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn glnexus_rnc_normalize_header_fix() -> Result<()> {
+    // GLnexus declares RNC as Type=Character,Number=2 but encodes "II"
+    // as a single string in BCF.  The raw VCF can't be read by RecordBuf
+    // conversion without the header fix — read_records on the input should
+    // fail.  After the processor normalizes the header, the output file's
+    // records become readable.
+    let dir = tempfile::tempdir()?;
+    let input_gz = dir.path().join("in.vcf.gz");
+    let output_gz = dir.path().join("out.vcf.gz");
+
+    let text = "\
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+##FORMAT=<ID=RNC,Number=2,Type=Character,Description=\"Reason for No Call\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2
+chr1\t100\t.\tA\tG\t.\t.\t.\tGT:RNC\t0/1:II\t1/1:XX
+chr1\t200\t.\tC\tT\t.\t.\t.\tGT:RNC\t0/0:..\t1/1:YY
+";
+
+    write_indexed_vcf(&input_gz, text);
+
+    // Raw input should FAIL RecordBuf conversion (RNC type mismatch)
+    let raw_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_records(&input_gz)
+    }));
+    assert!(raw_failed.is_err(),
+        "reading raw input without header fix should panic"
+    );
+
+    // Processor should succeed — normalize_header_for_noodles is called
+    // in execute()
+    ParallelVariantWindowProcessor::builder()
+        .input(&input_gz)
+        .with_output_file(&output_gz)
+        .worker_threads(2)
+        .window_size(5000)
+        .record_callback(Some)
+        .run()?;
+
+    let out = read_records(&output_gz);
+    assert_eq!(out.len(), 2, "output should have 2 records after fix");
+
+    // BCF round-trip
+    let input_bcf = dir.path().join("in.bcf");
+    let output_bcf = dir.path().join("out.bcf.vcf.gz");
+    write_indexed_bcf(&input_bcf, &input_gz);
+    ParallelVariantWindowProcessor::builder()
+        .input(&input_bcf)
+        .with_output_file(&output_bcf)
+        .worker_threads(2)
+        .window_size(5000)
+        .record_callback(Some)
+        .run()?;
+
+    let out_bcf = read_records(&output_bcf);
+    assert_eq!(out_bcf.len(), 2, "BCF output should have 2 records after fix");
+    assert_eq!(out, out_bcf,
+        "VCF.gz and BCF round-trip should produce identical records after header fix"
+    );
+
     Ok(())
 }

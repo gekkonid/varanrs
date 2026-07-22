@@ -25,11 +25,104 @@ use noodles_vcf as vcf;
 use vcf::variant::RecordBuf;
 use vcf::variant::io::Write as _;
 
+#[allow(dead_code)]
+fn dump_record_fields(record: &dyn vcf::variant::Record, header: &vcf::Header) -> String {
+    use std::fmt::Write;
+
+    let chrom = record
+        .reference_sequence_name(header)
+        .unwrap_or("<err>");
+    let pos = match record.variant_start() {
+        Some(Ok(p)) => p.get().to_string(),
+        _ => String::from("."),
+    };
+
+    let mut ref_bases = String::new();
+    for b in record.reference_bases().iter() {
+        match b {
+            Ok(c) => ref_bases.push(c as char),
+            Err(_) => ref_bases.push_str("<err>"),
+        }
+    }
+    if ref_bases.is_empty() {
+        ref_bases.push('.');
+    }
+
+    let mut alts = String::new();
+    for (i, a) in record.alternate_bases().iter().enumerate() {
+        if i > 0 {
+            alts.push(',');
+        }
+        match a {
+            Ok(s) => alts.push_str(s),
+            Err(_) => alts.push_str("<err>"),
+        }
+    }
+    if alts.is_empty() {
+        alts.push('.');
+    }
+
+    let qual = match record.quality_score() {
+        Some(Ok(q)) => format!("{q}"),
+        _ => String::from("."),
+    };
+
+    let mut buf = String::new();
+    write!(buf, "record dump: {chrom}\t{pos}\t.\t{ref_bases}\t{alts}\t{qual}\t.\t").ok();
+
+    let info = record.info();
+    let iter = info.iter(header);
+    {
+        let mut first = true;
+        for result in iter {
+            match result {
+                Ok((key, value)) => {
+                    if !first { buf.push(';'); }
+                    first = false;
+                    match value {
+                        Some(v) => write!(buf, "{key}={v:?}").ok(),
+                        None => write!(buf, "{key}").ok(),
+                    };
+                }
+                Err(e) => {
+                    if !first { buf.push(';'); }
+                    first = false;
+                    write!(buf, "<info_field_err:{e}>").ok();
+                }
+            }
+        }
+        if first { buf.push('.'); }
+    }
+
+    // FORMAT + sample summary
+    match record.samples() {
+        Ok(samples) => {
+            let keys = samples.column_names(header);
+            write!(buf, "\t").ok();
+            let mut first = true;
+            for k in keys {
+                if !first { buf.push(':'); }
+                first = false;
+                match k {
+                    Ok(name) => { buf.push_str(name); }
+                    Err(_) => { buf.push_str("<err>"); }
+                }
+            }
+            write!(buf, "\t{} samples", samples.len()).ok();
+        }
+        Err(e) => {
+            write!(buf, "\t<samples_err:{e}>").ok();
+        }
+    }
+
+    buf
+}
+
 /// Default per-window size, in base pairs.
 pub const DEFAULT_WINDOW_SIZE: u64 = 1_000_000;
 
 type RecordCallback = dyn Fn(RecordBuf) -> Option<RecordBuf> + Send + Sync + 'static;
-type ProgressCallback = dyn Fn(usize) + Send + Sync + 'static;
+type ProgressCallback = dyn Fn(u64, usize, usize) + Send + Sync + 'static;
 type HeaderCallback = Box<dyn FnOnce(&mut vcf::Header) + Send + 'static>;
 
 /// One contiguous slice of a single contig.
@@ -126,11 +219,11 @@ impl ParallelVariantWindowProcessorBuilder {
     }
 
     /// Optional. Invoked on the main writer thread after each window's bytes
-    /// have been written to the bgzf stream. Argument is the cumulative number
-    /// of bp covered by all written-and-completed windows so far.
+    /// have been written to the bgzf stream. Arguments: (cumulative bp,
+    /// completed windows, total windows).
     pub fn progress_callback<F>(mut self, f: F) -> Self
     where
-        F: Fn(usize) + Send + Sync + 'static,
+        F: Fn(u64, usize, usize) + Send + Sync + 'static,
     {
         self.progress_callback = Some(Arc::new(f));
         self
@@ -204,7 +297,8 @@ impl ParallelVariantWindowProcessor {
         let mut reader = variant::io::indexed_reader::Builder::default()
             .build_from_path(&input)
             .with_context(|| format!("failed to open indexed reader: {}", input.display()))?;
-        let input_header = reader.read_header().context("failed to read header")?;
+        let mut input_header = reader.read_header().context("failed to read header")?;
+        crate::util::normalize_header_for_noodles(&mut input_header);
         let indexed_contigs: Option<std::collections::HashSet<Vec<u8>>> = reader
             .index()
             .header()
@@ -221,8 +315,6 @@ impl ParallelVariantWindowProcessor {
 
         // 3. Enumerate windows from the input header's contigs.
         let windows = enumerate_windows(&input_header, window_size, stride, indexed_contigs.as_ref(), contig_filter.as_ref(), contig_lengths.as_ref());
-
-        eprintln!("varanrs: {} windows to process (stride={}, chunk={}bp)", windows.len(), stride, window_size);
 
         // 4. Open output and write the header through a multithreaded bgzf
         //    writer. If no output path was provided, run in side-effect-only
@@ -255,6 +347,10 @@ impl ParallelVariantWindowProcessor {
 
         // 6. Run the producer + workers + writer in a scope.
         std::thread::scope(|scope| -> Result<()> {
+            // Move out_rx into the scope so it's dropped when the writer
+            // finishes (or errors), unblocking workers' sends.
+            let out_rx = out_rx;
+
             // Producer: enumerate windows.
             let work_tx_producer = work_tx.clone();
             let windows_for_producer = windows.clone();
@@ -275,42 +371,42 @@ impl ParallelVariantWindowProcessor {
                 let input_header = Arc::clone(&input_header);
                 let output_header = Arc::clone(&output_header);
                 let record_callback = Arc::clone(&record_callback);
-                scope.spawn(move || {
-                    let mut reader = match variant::io::indexed_reader::Builder::default()
-                        .build_from_path(&input)
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // Send the error tagged to whatever window we were going to handle.
-                            // Drain in the meantime so the producer doesn't block.
-                            while let Ok(w) = work_rx.recv() {
-                                let _ = out_tx.send((
-                                    w.idx,
-                                    w.bp(),
-                                    Err(anyhow!(
-                                        "worker failed to open indexed reader for {}: {e}",
-                                        input.display()
-                                    )),
-                                ));
-                            }
-                            return;
-                        }
-                    };
-
-                    while let Ok(window) = work_rx.recv() {
-                        let bp = window.bp();
-                        let result = process_window(
-                            &mut reader,
-                            &input_header,
-                            if serialize { Some(output_header.as_ref()) } else { None },
-                            &window,
-                            record_callback.as_ref(),
-                        );
-                        if out_tx.send((window.idx, bp, result)).is_err() {
-                            break;
-                        }
+        scope.spawn(move || {
+            let mut reader = match variant::io::indexed_reader::Builder::default()
+                .build_from_path(&input)
+            {
+            Ok(r) => r,
+            Err(e) => {
+                    // Send the error tagged to whatever window we were going to handle.
+                    // Drain in the meantime so the producer doesn't block.
+                    while let Ok(w) = work_rx.recv() {
+                        let _ = out_tx.send((
+                            w.idx,
+                            w.bp(),
+                            Err(anyhow!(
+                                "worker failed to open indexed reader for {}: {e}",
+                                input.display()
+                            )),
+                        ));
                     }
-                });
+                    return;
+                }
+            };
+
+            while let Ok(window) = work_rx.recv() {
+                let bp = window.bp();
+                let result = process_window(
+                    &mut reader,
+                    &input_header,
+                    if serialize { Some(output_header.as_ref()) } else { None },
+                    &window,
+                    record_callback.as_ref(),
+                );
+                if out_tx.send((window.idx, bp, result)).is_err() {
+                    break;
+                }
+            }
+        });
             }
             drop(out_tx);
 
@@ -318,9 +414,18 @@ impl ParallelVariantWindowProcessor {
             let mut buffer: BTreeMap<usize, (u64, Vec<u8>)> = BTreeMap::new();
             let mut next_idx = 0usize;
             let mut cum_bp: u64 = 0;
+            let mut window_errors: Vec<(usize, anyhow::Error)> = Vec::new();
+            let total_windows = windows.len();
             while let Ok((idx, bp, result)) = out_rx.recv() {
-                let bytes = result.with_context(|| format!("worker failed on window {idx}"))?;
-                buffer.insert(idx, (bp, bytes));
+                match result {
+                    Ok(bytes) => {
+                        buffer.insert(idx, (bp, bytes));
+                    }
+                    Err(e) => {
+                        window_errors.push((idx, e));
+                        buffer.insert(idx, (bp, Vec::new()));
+                    }
+                }
                 while let Some((bp, bytes)) = buffer.remove(&next_idx) {
                     if let Some(w) = mt_writer.as_mut() {
                         w.write_all(&bytes)
@@ -328,10 +433,23 @@ impl ParallelVariantWindowProcessor {
                     }
                     cum_bp += bp;
                     if let Some(cb) = progress_callback.as_ref() {
-                        cb(cum_bp as usize);
+                        cb(cum_bp, next_idx + 1, total_windows);
                     }
                     next_idx += 1;
                 }
+            }
+
+            if !window_errors.is_empty() {
+                for (idx, e) in &window_errors {
+                    eprintln!("varanrs: window {idx} failed: {e}");
+                }
+                return Err(anyhow!(
+                    "{} of {} windows failed (first: window {}: {})",
+                    window_errors.len(),
+                    windows.len(),
+                    window_errors[0].0,
+                    window_errors[0].1,
+                ));
             }
 
             if next_idx != windows.len() {
@@ -439,17 +557,47 @@ where
         .with_context(|| format!("query failed for {}:{}-{}", window.contig, window.start, window.end))?;
 
     let mut bytes = Vec::new();
+    let mut skipped = 0usize;
     match output_header {
         Some(out_header) => {
             let mut writer = vcf::io::Writer::new(&mut bytes);
             for result in query {
-                let record = result.context("error reading record")?;
-                let Some(pos) = take_pos_if_in_window(record.as_ref(), window)? else {
-                    continue;
+                let record = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        skipped += 1;
+                        eprintln!(
+                            "varanrs: window {} {}:{}-{}: error reading record: {e}",
+                            window.idx, window.contig, window.start, window.end
+                        );
+                        continue;
+                    }
                 };
-                let _ = pos;
-                let buf = RecordBuf::try_from_variant_record(input_header, record.as_ref())
-                    .context("failed to materialize RecordBuf")?;
+                let _pos = match take_pos_if_in_window(record.as_ref(), window) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        skipped += 1;
+                        eprintln!(
+                            "varanrs: window {} {}:{}-{}: skipping record ({e})",
+                            window.idx, window.contig, window.start, window.end
+                        );
+                        continue;
+                    }
+                };
+                let buf = match RecordBuf::try_from_variant_record(input_header, record.as_ref()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        skipped += 1;
+                        if skipped <= 5 {
+                            eprintln!(
+                                "varanrs: window {} {}:{}-{}: skipping record (RecordBuf conversion failed: {e})",
+                                window.idx, window.contig, window.start, window.end
+                            );
+                        }
+                        continue;
+                    }
+                };
                 if let Some(out) = record_callback(buf) {
                     writer
                         .write_variant_record(out_header, &out)
@@ -458,18 +606,53 @@ where
             }
         }
         None => {
-            // Side-effect-only mode: never allocate writer, never serialize.
             for result in query {
-                let record = result.context("error reading record")?;
-                let Some(pos) = take_pos_if_in_window(record.as_ref(), window)? else {
-                    continue;
+                let record = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        skipped += 1;
+                        eprintln!(
+                            "varanrs: window {} {}:{}-{}: error reading record: {e}",
+                            window.idx, window.contig, window.start, window.end
+                        );
+                        continue;
+                    }
                 };
-                let _ = pos;
-                let buf = RecordBuf::try_from_variant_record(input_header, record.as_ref())
-                    .context("failed to materialize RecordBuf")?;
+                let _pos = match take_pos_if_in_window(record.as_ref(), window) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        skipped += 1;
+                        eprintln!(
+                            "varanrs: window {} {}:{}-{}: skipping record ({e})",
+                            window.idx, window.contig, window.start, window.end
+                        );
+                        continue;
+                    }
+                };
+                let buf = match RecordBuf::try_from_variant_record(input_header, record.as_ref()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        skipped += 1;
+                        if skipped <= 5 {
+                            eprintln!(
+                                "varanrs: window {} {}:{}-{}: skipping record (RecordBuf conversion failed: {e})",
+                                window.idx, window.contig, window.start, window.end
+                            );
+                        }
+                        continue;
+                    }
+                };
                 let _ = record_callback(buf);
             }
         }
+    }
+    if skipped > 5 {
+        eprintln!(
+            "varanrs: window {} {}:{}-{}: {} further records skipped",
+            window.idx, window.contig, window.start, window.end,
+            skipped - 5
+        );
     }
     Ok(bytes)
 }

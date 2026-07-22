@@ -11,6 +11,7 @@ use noodles_util::variant;
 use crate::args::{self, IndexedInput};
 use crate::processor::ParallelVariantWindowProcessor;
 use crate::snpsketch::SketchAccumulator;
+use crate::util::human_bp;
 
 #[derive(Args, Debug)]
 pub struct SketchArgs {
@@ -109,8 +110,17 @@ pub fn run(args: SketchArgs) -> Result<()> {
         .window_size(args.chunk)
         .stride(args.stride)
         .record_callback(record_callback)
-        .progress_callback(|bp| {
-            eprint!("\r  {} Mbp sampled", bp / 1_000_000);
+        .progress_callback(|cum_bp, done, total| {
+            let pct = if total > 0 {
+                done as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            let (val, unit) = human_bp(cum_bp);
+            eprint!(
+                "\r  {:.1}% ({}/{})  {:.1}{}  ",
+                pct, done, total, val, unit
+            );
             use std::io::Write as _;
             std::io::stderr().flush().ok();
         });

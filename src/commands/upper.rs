@@ -31,7 +31,7 @@ pub fn run(args: UpperArgs) -> Result<()> {
         .with_output_file(args.output)
         .worker_threads(threads)
         .record_callback(uppercase_alleles)
-        .progress_callback(|bp| {
+        .progress_callback(|bp, _, _| {
             eprint!("\r  {} Mbp processed", bp / 1_000_000);
             use std::io::Write as _;
             std::io::stderr().flush().ok();
