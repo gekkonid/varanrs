@@ -1,4 +1,4 @@
-//! `upper`: force REF/ALT alleles to uppercase. GLnexus workaround.
+//! `uppercase-alleles`: force REF/ALT alleles to uppercase. GLnexus workaround.
 
 use std::io::Write;
 
@@ -14,7 +14,7 @@ use crate::processor::ParallelVariantWindowProcessor;
 use crate::util::uppercase_alleles;
 
 #[derive(Args, Debug)]
-pub struct UpperArgs {
+pub struct UppercaseAllelesArgs {
     #[command(flatten)]
     pub indexed: IndexedInput,
 
@@ -43,7 +43,7 @@ fn open_writer(output: &Option<String>) -> Result<Box<dyn Write>> {
     }
 }
 
-pub fn run(args: UpperArgs) -> Result<()> {
+pub fn run(args: UppercaseAllelesArgs) -> Result<()> {
     let Some(input) = args.indexed.input.as_ref() else {
         // Stdin path: auto-detect VCF or uBCF, apply uppercase, write stdout
         let boxed: Box<dyn std::io::BufRead> =
@@ -83,7 +83,7 @@ pub fn run(args: UpperArgs) -> Result<()> {
 
     if is_stdout(&args.output) {
         return Err(anyhow::anyhow!(
-            "upper with indexed input requires --output (cannot write bgzf to stdout)"
+            "uppercase-alleles with indexed input requires --output (cannot write bgzf to stdout)"
         ));
     }
     builder = builder.with_output_file(args.output.as_ref().unwrap());

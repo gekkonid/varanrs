@@ -6,13 +6,13 @@ use std::path::Path;
 use anyhow::Result;
 
 fn run_filter(input: &Path, output: &Path, min_ac: Option<u32>, min_af: Option<f64>) -> Result<()> {
-    let args = varanrs::commands::filter::FilterArgs {
+    let args = varanrs::commands::allelefilter::AllelefilterArgs {
         input: Some(input.display().to_string()),
         output: Some(output.display().to_string()),
         min_ac,
         min_af,
     };
-    varanrs::commands::filter::run(args)
+    varanrs::commands::allelefilter::run(args)
 }
 
 fn read_text(path: &Path) -> String {
@@ -314,7 +314,7 @@ chr1\t200\t.\tG\tC\t.\t.\t.\tGT\t0/0
 ";
 
     let mut child = Command::new(varanrs_binary())
-        .arg("filter")
+        .arg("allelefilter")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -342,7 +342,7 @@ chr1\t200\t.\tG\tC\t.\t.\t.\tGT\t1/1\t0/1
 ";
 
     let mut child = Command::new(varanrs_binary())
-        .args(["filter", "--min-ac", "3"])
+        .args(["allelefilter", "--min-ac", "3"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -388,7 +388,7 @@ chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1
         .spawn()?;
 
     let consumer = Command::new(varanrs_binary())
-        .arg("filter")
+        .arg("allelefilter")
         .stdin(producer.stdout.unwrap())
         .stdout(Stdio::piped())
         .spawn()?;

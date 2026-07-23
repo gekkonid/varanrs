@@ -46,7 +46,7 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
 ";
     write_indexed_vcf(&input, text);
 
-    let args = varanrs::commands::upper::UpperArgs {
+    let args = varanrs::commands::uppercase_alleles::UppercaseAllelesArgs {
         indexed: varanrs::args::IndexedInput {
             input: Some(input.clone()),
             threads: Some(2),
@@ -56,7 +56,7 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
         output: Some(output.display().to_string()),
         window_size: Some(1000),
     };
-    varanrs::commands::upper::run(args)?;
+    varanrs::commands::uppercase_alleles::run(args)?;
 
     let mut reader = variant::io::reader::Builder::default().build_from_path(&output)?;
     let header = reader.read_header()?;
@@ -93,7 +93,7 @@ chr1\t200\t.\tc\tG,a\t.\t.\t.\tGT\t1/2
 ";
 
     let mut child = Command::new(varanrs_binary())
-        .arg("upper")
+        .arg("uppercase-alleles")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -139,7 +139,7 @@ chr1\t100\t.\ta\tt\t.\t.\t.\tGT\t0/1
         .spawn()?;
 
     let consumer = Command::new(varanrs_binary())
-        .arg("upper")
+        .arg("uppercase-alleles")
         .stdin(producer.stdout.unwrap())
         .stdout(Stdio::piped())
         .spawn()?;

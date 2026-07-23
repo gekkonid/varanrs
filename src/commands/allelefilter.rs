@@ -1,4 +1,4 @@
-//! `filter`: per-site allele filtering by minimum AC and/or AF.
+//! `allelefilter`: per-site allele filtering by minimum AC and/or AF.
 
 use std::io::Write;
 
@@ -12,7 +12,7 @@ use vcf::variant::io::Write as _;
 use crate::filter::filter_alleles_at_site;
 
 #[derive(Args, Debug)]
-pub struct FilterArgs {
+pub struct AllelefilterArgs {
     /// Input VCF/BCF path. Reads stdin when omitted or set to "-".
     #[arg()]
     pub input: Option<String>,
@@ -62,7 +62,7 @@ fn open_writer(output: &Option<String>) -> Result<Box<dyn Write>> {
     }
 }
 
-pub fn run(args: FilterArgs) -> Result<()> {
+pub fn run(args: AllelefilterArgs) -> Result<()> {
     let mut reader = open_reader(&args.input)?;
 
     let mut header = reader

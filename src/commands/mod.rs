@@ -1,5 +1,5 @@
 //! Subcommand modules for the `varanrs` CLI.
 
-pub mod filter;
+pub mod allelefilter;
 pub mod snpsketch;
-pub mod upper;
+pub mod uppercase_alleles;

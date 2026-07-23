@@ -14,17 +14,17 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Per-site allele filtering by minimum AC and/or AF.
-    Filter(commands::filter::FilterArgs),
+    Allelefilter(commands::allelefilter::AllelefilterArgs),
     /// Subsample an indexed VCF/BCF, estimate pairwise distances and per-sample missingness.
     Snpsketch(commands::snpsketch::SketchArgs),
     /// Force REF and ALT alleles to uppercase (GLnexus workaround).
-    Upper(commands::upper::UpperArgs),
+    UppercaseAlleles(commands::uppercase_alleles::UppercaseAllelesArgs),
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Filter(args) => commands::filter::run(args),
+        Command::Allelefilter(args) => commands::allelefilter::run(args),
         Command::Snpsketch(args) => commands::snpsketch::run(args),
-        Command::Upper(args) => commands::upper::run(args),
+        Command::UppercaseAlleles(args) => commands::uppercase_alleles::run(args),
     }
 }
