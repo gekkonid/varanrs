@@ -95,7 +95,22 @@ pub fn filter_alleles_at_site(
             .collect();
         *buf.alternate_bases_mut().as_mut() = new_alts;
 
-        rebuild_samples(&mut buf, header, &remap, &inv_remap, n_total_old, n_total_new);
+        let format_numbers: Vec<FormatNumber> = buf.samples().keys().as_ref().iter()
+            .map(|key| {
+                header.formats().get(key)
+                    .map(|m| m.number())
+                    .unwrap_or(FormatNumber::Count(1))
+            })
+            .collect();
+
+        rebuild_samples(
+            &mut buf,
+            &remap,
+            &inv_remap,
+            n_total_old,
+            n_total_new,
+            &format_numbers,
+        );
         rebuild_info(
             &mut buf,
             header,
@@ -104,10 +119,12 @@ pub fn filter_alleles_at_site(
             n_total_old,
             n_total_new,
         );
-    }
 
-    let counts_post = count_alleles(&buf, 1 + kept_alt_idx.len());
-    update_count_info_fields(&mut buf, header, &counts_post, kept_alt_idx.len());
+        let counts_post = count_alleles(&buf, n_total_new);
+        update_count_info_fields(&mut buf, header, &counts_post, n_kept_alt);
+    } else {
+        update_count_info_fields(&mut buf, header, &counts_pre, n_alt);
+    }
 
     Some(buf)
 }
@@ -172,24 +189,20 @@ fn count_alleles(buf: &RecordBuf, n_total: usize) -> AlleleCounts {
 
 fn rebuild_samples(
     buf: &mut RecordBuf,
-    header: &Header,
     remap: &[Option<usize>],
     inv_remap: &[usize],
     n_total_old: usize,
     n_total_new: usize,
+    format_numbers: &[FormatNumber],
 ) {
-    let keys = buf.samples().keys().clone();
-    let key_list: Vec<String> = keys.as_ref().iter().cloned().collect();
-    let gt_idx = keys.as_ref().get_index_of("GT");
+    let gt_idx = buf.samples().keys().as_ref().get_index_of("GT");
     let mut new_values: Vec<Vec<Option<SampleValue>>> = Vec::with_capacity(buf.samples().len());
 
     for row in buf.samples().values() {
         let row_values = row.values();
-        // Decide whether this sample's GT references any removed allele.
         let (gt_lost, ploidy) = inspect_genotype(row_values, gt_idx, remap);
 
         if gt_lost {
-            // Set everything to missing for this sample, preserving ploidy on GT.
             let mut new_row = Vec::with_capacity(row_values.len());
             for (i, _) in row_values.iter().enumerate() {
                 if Some(i) == gt_idx {
@@ -207,22 +220,15 @@ fn rebuild_samples(
             continue;
         }
 
-        // Otherwise: remap GT alleles, slice A/R/G arrays per FORMAT field.
         let mut new_row: Vec<Option<SampleValue>> = Vec::with_capacity(row_values.len());
         for (i, cell) in row_values.iter().enumerate() {
             if Some(i) == gt_idx {
                 new_row.push(remap_genotype_cell(cell, remap));
                 continue;
             }
-            let key = &key_list[i];
-            let number = header
-                .formats()
-                .get(key)
-                .map(|m| m.number())
-                .unwrap_or(FormatNumber::Count(1));
             new_row.push(reslice_sample_cell(
-                cell.clone(),
-                number,
+                cell,
+                format_numbers[i],
                 inv_remap,
                 n_total_old,
                 n_total_new,
@@ -232,6 +238,7 @@ fn rebuild_samples(
         new_values.push(new_row);
     }
 
+    let keys = buf.samples().keys().clone();
     *buf.samples_mut() = Samples::new(keys, new_values);
 }
 
@@ -278,30 +285,29 @@ fn remap_genotype_cell(
 }
 
 fn reslice_sample_cell(
-    cell: Option<SampleValue>,
+    cell: &Option<SampleValue>,
     number: FormatNumber,
     inv_remap: &[usize],
     n_total_old: usize,
     n_total_new: usize,
     ploidy: usize,
 ) -> Option<SampleValue> {
-    let v = cell?;
+    let v = cell.as_ref()?;
     let SampleValue::Array(arr) = v else {
-        // Number=A/R/G with a scalar shouldn't happen, but if it does, leave alone.
-        return Some(v);
+        return Some(v.clone());
     };
     match number {
         FormatNumber::AlternateBases => Some(SampleValue::Array(slice_sample_array(
-            arr,
+            arr.clone(),
             &a_indices(inv_remap),
         ))),
         FormatNumber::ReferenceAlternateBases => Some(SampleValue::Array(slice_sample_array(
-            arr,
+            arr.clone(),
             &r_indices(inv_remap),
         ))),
-        FormatNumber::Samples => slice_sample_array_g(arr, n_total_old, n_total_new, ploidy, inv_remap)
+        FormatNumber::Samples => slice_sample_array_g(arr.clone(), n_total_old, n_total_new, ploidy, inv_remap)
             .map(SampleValue::Array),
-        _ => Some(SampleValue::Array(arr)),
+        _ => Some(SampleValue::Array(arr.clone())),
     }
 }
 

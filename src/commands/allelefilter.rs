@@ -1,6 +1,6 @@
 //! `allelefilter`: per-site allele filtering by minimum AC and/or AF.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -52,12 +52,14 @@ fn open_reader(
 
 fn open_writer(output: &Option<String>) -> Result<Box<dyn Write>> {
     if is_std(output) {
-        Ok(Box::new(std::io::stdout().lock()))
+        Ok(Box::new(BufWriter::new(std::io::stdout().lock())))
     } else {
         let path = output.as_ref().unwrap();
         Ok(Box::new(
-            std::fs::File::create(path)
-                .with_context(|| format!("failed to create output: {path}"))?,
+            BufWriter::new(
+                std::fs::File::create(path)
+                    .with_context(|| format!("failed to create output: {path}"))?,
+            ),
         ))
     }
 }
