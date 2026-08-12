@@ -16,6 +16,8 @@ pub struct SketchAccumulator {
     calls: Vec<BitVec<u64, Lsb0>>,
     any_alt: Vec<BitVec<u64, Lsb0>>,
     hom_alt: Vec<BitVec<u64, Lsb0>>,
+    dp_sums: Vec<u64>,
+    dp_counts: Vec<u64>,
 }
 
 impl SketchAccumulator {
@@ -29,6 +31,8 @@ impl SketchAccumulator {
             calls: vec![BitVec::new(); n],
             any_alt: vec![BitVec::new(); n],
             hom_alt: vec![BitVec::new(); n],
+            dp_sums: vec![0u64; n],
+            dp_counts: vec![0u64; n],
         }
     }
 
@@ -66,6 +70,7 @@ impl SketchAccumulator {
         let samples = buf.samples();
         let keys = samples.keys().as_ref();
         let gt_idx = keys.get_index_of("GT");
+        let dp_idx = keys.get_index_of("DP");
         let n_samples = self.calls.len();
 
         let mut processed = 0usize;
@@ -106,6 +111,14 @@ impl SketchAccumulator {
                 self.calls[s_idx].push(true);
                 self.any_alt[s_idx].push(n_alt > 0);
                 self.hom_alt[s_idx].push(n_alt == ploidy);
+            }
+
+            if let Some(idx) = dp_idx
+                && let Some(SampleValue::Integer(dp)) =
+                    sample.values().get(idx).and_then(|v| v.as_ref())
+            {
+                self.dp_sums[s_idx] += *dp as u64;
+                self.dp_counts[s_idx] += 1;
             }
         }
 
@@ -247,26 +260,57 @@ impl SketchAccumulator {
         Ok(())
     }
 
-    pub fn write_missingness_csv<W: Write>(&self, writer: W) -> Result<()> {
+    pub fn write_sample_stats_csv<W: Write>(&self, writer: W) -> Result<()> {
         let n = self.n_samples();
         let mut w = csv::Writer::from_writer(writer);
 
-        w.write_record(["sample_id", "n_missing", "n_total", "miss_rate"])?;
+        w.write_record([
+            "sample_id", "n_missing", "n_total", "miss_rate",
+            "n_het", "het_rate", "avg_dp",
+        ])?;
 
         let n_total = self.n_sites as u64;
         for s_idx in 0..n {
             let n_called = self.calls[s_idx].count_ones() as u64;
             let n_missing = n_total.saturating_sub(n_called);
-            let rate = if n_total > 0 {
+            let miss_rate = if n_total > 0 {
                 n_missing as f64 / n_total as f64
             } else {
                 f64::NAN
             };
+
+            let n_alt = self.any_alt[s_idx].count_ones() as u64;
+            let n_hom_alt = self.hom_alt[s_idx].count_ones() as u64;
+            let n_het = n_alt.saturating_sub(n_hom_alt);
+            let het_rate = if n_called > 0 {
+                n_het as f64 / n_called as f64
+            } else {
+                f64::NAN
+            };
+
+            let avg_dp = if self.dp_counts[s_idx] > 0 {
+                self.dp_sums[s_idx] as f64 / self.dp_counts[s_idx] as f64
+            } else {
+                f64::NAN
+            };
+
+            let avg_dp_str;
+            let avg_dp_col = if avg_dp.is_nan() {
+                avg_dp_str = String::new();
+                avg_dp_str.as_str()
+            } else {
+                avg_dp_str = format!("{:.1}", avg_dp);
+                avg_dp_str.as_str()
+            };
+
             w.write_record([
                 self.sample_ids[s_idx].as_str(),
                 &n_missing.to_string(),
                 &n_total.to_string(),
-                &format!("{:.6}", rate),
+                &format!("{:.6}", miss_rate),
+                &n_het.to_string(),
+                &format!("{:.6}", het_rate),
+                avg_dp_col,
             ])?;
         }
 

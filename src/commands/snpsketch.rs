@@ -27,8 +27,8 @@ pub struct SketchArgs {
     #[arg(long, default_value = "pairs.csv")]
     pub pairs: PathBuf,
 
-    #[arg(long, default_value = "missing.csv")]
-    pub missing: PathBuf,
+    #[arg(long, default_value = "sample_stats.csv")]
+    pub sample_stats: PathBuf,
 
     #[arg(long)]
     pub genotypes: Option<PathBuf>,
@@ -152,13 +152,13 @@ pub fn run(args: SketchArgs) -> Result<()> {
     acc.write_pairs_csv(pairs_file)
         .with_context(|| format!("failed to write {}", args.pairs.display()))?;
 
-    let missing_file = BufWriter::new(
-        File::create(&args.missing)
-            .with_context(|| format!("failed to create {}", args.missing.display()))?,
+    let sample_stats_file = BufWriter::new(
+        File::create(&args.sample_stats)
+            .with_context(|| format!("failed to create {}", args.sample_stats.display()))?,
     );
-    eprintln!("  writing {}", args.missing.display());
-    acc.write_missingness_csv(missing_file)
-        .with_context(|| format!("failed to write {}", args.missing.display()))?;
+    eprintln!("  writing {}", args.sample_stats.display());
+    acc.write_sample_stats_csv(sample_stats_file)
+        .with_context(|| format!("failed to write {}", args.sample_stats.display()))?;
 
     if let Some(ref genotypes_path) = args.genotypes {
         let genotypes_file = BufWriter::new(

@@ -244,7 +244,7 @@ chr1	200	.	C	T	.	.	.	GT	./.	0/1
 }
 
 #[test]
-fn missingness_csv_output() {
+fn sample_stats_csv_output() {
     let vcf = "\
 ##fileformat=VCFv4.2
 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
@@ -255,12 +255,32 @@ chr1	200	.	C	T	.	.	.	GT	0/1	0/0
     let acc = make_acc_from_vcf(vcf);
 
     let mut csv = Cursor::new(Vec::new());
-    acc.write_missingness_csv(&mut csv).unwrap();
+    acc.write_sample_stats_csv(&mut csv).unwrap();
     let output = String::from_utf8(csv.into_inner()).unwrap();
 
-    assert!(output.contains("sample_id,n_missing,n_total,miss_rate"));
-    assert!(output.contains("S1,0,2,0.000000"));
-    assert!(output.contains("S2,1,2,0.500000"));
+    assert!(output.contains("sample_id,n_missing,n_total,miss_rate,n_het,het_rate,avg_dp"));
+    assert!(output.contains("S1,0,2,0.000000,1,0.500000,"));
+    assert!(output.contains("S2,1,2,0.500000,0,0.000000,"));
+}
+
+#[test]
+fn sample_stats_csv_with_dp() {
+    let vcf = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	S1	S2
+chr1	100	.	A	G	.	.	.	GT:DP	0/0:10	0/1:30
+chr1	200	.	C	T	.	.	.	GT:DP	1/1:20	./.:.
+";
+    let acc = make_acc_from_vcf(vcf);
+
+    let mut csv = Cursor::new(Vec::new());
+    acc.write_sample_stats_csv(&mut csv).unwrap();
+    let output = String::from_utf8(csv.into_inner()).unwrap();
+
+    assert!(output.contains("S1,0,2,0.000000,0,0.000000,15.0"));
+    assert!(output.contains("S2,1,2,0.500000,1,1.000000,30.0"));
 }
 
 #[test]
