@@ -23,9 +23,9 @@ All region-parallel subcommands use the following args for input and computation
 | Flag | Description |
 |---|---|
 | `<INPUT>` | Positional. Variant file, or omit for stdin on supported commands |
-| `--threads <N>` | Worker thread count (default: system parallelism) |
-| `--contig <NAME>` | Restrict to contig(s) (repeatable) |
-| `--fai <PATH>` | FASTA index for contig names, lengths, and custom ordering — used when the VCF header lacks `##contig` length info |
+| `--threads <N>` | Worker thread count (default: all cpus) |
+| `--contig <NAME>` | Restrict to contig(s) (can be given many times) |
+| `--fai <PATH>` | FASTA index for contig names, lengths, and custom ordering, must be used when the VCF header lacks `##contig` length info |
 
 
 
