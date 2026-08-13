@@ -5,6 +5,16 @@ VARiant ANalysis in RuSt
 (pronounced, *Varanus*, like the genus of monitor lizards)
 
 
+# TL;DR 
+
+This toolkit consists of several tools for VCF/BCF manipulation:
+
+* `varanrs snpsketch`: generate a very fast, parallelised summary of a huge VCF/BCF, reporting sample stats (missingness, het rate, depth), inter-sample distances, and snp-level summaries (histograms over any numeric INFO/XXXX fields). Optionally outputs a subset of variants in an R-freindly CSV
+* `varanrs allelefilter`: separately filter each ALT allele of a VCF, on MAC/MAF. At multiallelic sites, removes alleles individually, returning to an N-1-allelic site (e.g. drops a very rare third allele, yielding a bialelleic site with missing data where the third allele was).
+* `varanrs uppercase-alleles`: forces REF and ALT columns to upper case to work around bugs in various programs.
+* And more coming as soon as I need them...
+
+
 # Usage
 
 
