@@ -455,3 +455,108 @@ chr1	300	.	T	C	.	.	.	GT	1/1	0/0
 
     assert_eq!(rows, expected);
 }
+
+#[test]
+fn info_stats_csv_output() {
+    let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">
+##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total alleles\">
+##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">
+##INFO=<ID=MQ,Number=1,Type=Float,Description=\"Mapping quality\">
+##INFO=<ID=DB,Number=0,Type=Flag,Description=\"dbSNP membership\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	S1
+chr1	100	.	A	G	.	.	AC=5;AN=10;AF=0.5;MQ=60.0;DB	GT	0/1
+chr1	200	.	C	T	.	.	AC=3;AN=8;AF=0.375;MQ=45.0	GT	0/1
+";
+    let (header, records) = parse_vcf_text(vcf);
+    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
+    let contig_rank: IndexMap<String, usize> = header
+        .contigs()
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.to_string(), i))
+        .collect();
+    let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
+    acc.init_info_histograms(&header, 100);
+    for rec in &records {
+        acc.process_record(rec);
+    }
+
+    let mut csv = Cursor::new(Vec::new());
+    acc.write_info_stats_csv(&mut csv).unwrap();
+    let output = String::from_utf8(csv.into_inner()).unwrap();
+
+    assert!(output.contains("field,bin_mean,count"));
+    assert!(output.contains("AC,3.000000,1"));
+    assert!(output.contains("AC,5.000000,1"));
+    assert!(output.contains("AN,8.000000,1"));
+    assert!(output.contains("AN,10.000000,1"));
+    assert!(output.contains("AF,0.375000,1"));
+    assert!(output.contains("AF,0.500000,1"));
+    assert!(output.contains("MQ"));
+    assert!(!output.contains("DB"));
+}
+
+#[test]
+fn info_stats_csv_number_r_takes_index_one() {
+    let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=BaseQRankSum,Number=R,Type=Float,Description=\"\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	S1
+chr1	100	.	A	G	.	.	BaseQRankSum=1.1,2.2	GT	0/1
+";
+    let (header, records) = parse_vcf_text(vcf);
+    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
+    let contig_rank: IndexMap<String, usize> = header
+        .contigs()
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.to_string(), i))
+        .collect();
+    let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
+    acc.init_info_histograms(&header, 100);
+    for rec in &records {
+        acc.process_record(rec);
+    }
+
+    let mut csv = Cursor::new(Vec::new());
+    acc.write_info_stats_csv(&mut csv).unwrap();
+    let output = String::from_utf8(csv.into_inner()).unwrap();
+
+    assert!(output.contains("field,bin_mean,count"));
+    assert!(output.contains("BaseQRankSum,2.200000,1"));
+    assert!(!output.contains("BaseQRankSum,1.100000"));
+}
+
+#[test]
+fn info_stats_no_numeric_fields() {
+    let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=DB,Number=0,Type=Flag,Description=\"dbSNP membership\">
+##INFO=<ID=DESC,Number=1,Type=String,Description=\"Description\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	S1
+chr1	100	.	A	G	.	.	DB	GT	0/1
+";
+    let (header, _records) = parse_vcf_text(vcf);
+    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
+    let contig_rank: IndexMap<String, usize> = header
+        .contigs()
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.to_string(), i))
+        .collect();
+    let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
+    acc.init_info_histograms(&header, 100);
+
+    let mut csv = Cursor::new(Vec::new());
+    acc.write_info_stats_csv(&mut csv).unwrap();
+    let output = String::from_utf8(csv.into_inner()).unwrap();
+
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0], "field,bin_mean,count");
+}

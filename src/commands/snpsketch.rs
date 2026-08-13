@@ -32,6 +32,12 @@ pub struct SketchArgs {
 
     #[arg(long)]
     pub genotypes: Option<PathBuf>,
+
+    #[arg(long)]
+    pub info_stats: Option<PathBuf>,
+
+    #[arg(long, default_value = "100")]
+    pub info_hist_bins: usize,
 }
 
 pub fn run(args: SketchArgs) -> Result<()> {
@@ -98,6 +104,13 @@ pub fn run(args: SketchArgs) -> Result<()> {
         sample_ids.clone(),
         contig_rank,
     )));
+
+    if args.info_stats.is_some() {
+        accumulator
+            .lock()
+            .unwrap()
+            .init_info_histograms(&header, args.info_hist_bins);
+    }
 
     let acc = Arc::clone(&accumulator);
     let record_callback = move |buf| {
@@ -168,6 +181,16 @@ pub fn run(args: SketchArgs) -> Result<()> {
         eprintln!("  writing {}", genotypes_path.display());
         acc.write_genotypes_csv(genotypes_file)
             .with_context(|| format!("failed to write {}", genotypes_path.display()))?;
+    }
+
+    if let Some(ref info_stats_path) = args.info_stats {
+        let info_stats_file = BufWriter::new(
+            File::create(info_stats_path)
+                .with_context(|| format!("failed to create {}", info_stats_path.display()))?,
+        );
+        eprintln!("  writing {}", info_stats_path.display());
+        acc.write_info_stats_csv(info_stats_file)
+            .with_context(|| format!("failed to write {}", info_stats_path.display()))?;
     }
 
     eprintln!("  done.");

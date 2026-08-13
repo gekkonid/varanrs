@@ -3,10 +3,57 @@ use std::io::Write;
 use anyhow::Result;
 use bitvec::order::Lsb0;
 use bitvec::vec::BitVec;
+use histr::StreamHist;
 use indexmap::IndexMap;
 use noodles_vcf as vcf;
-use vcf::variant::record_buf::samples::sample::Value as SampleValue;
+use vcf::header::record::value::map::info::Number as InfoNumber;
+use vcf::variant::record_buf::info::field::Value as InfoValue;
+use vcf::variant::record_buf::info::field::value::Array as InfoArray;
 use vcf::variant::RecordBuf;
+use vcf::variant::record_buf::samples::sample::Value as SampleValue;
+
+struct InfoHistogram {
+    name: String,
+    number: InfoNumber,
+    hist: StreamHist,
+}
+
+fn insert_info_value(val: &InfoValue, hist: &mut StreamHist, target_idx: usize) {
+    match val {
+        InfoValue::Integer(n) => {
+            let v = *n as f64;
+            if v.is_finite() {
+                hist.insert(v);
+            }
+        }
+        InfoValue::Float(f) => {
+            let v = *f as f64;
+            if v.is_finite() {
+                hist.insert(v);
+            }
+        }
+        InfoValue::Array(arr) => match arr {
+            InfoArray::Integer(v) => {
+                if let Some(Some(n)) = v.get(target_idx) {
+                    let v = *n as f64;
+                    if v.is_finite() {
+                        hist.insert(v);
+                    }
+                }
+            }
+            InfoArray::Float(v) => {
+                if let Some(Some(f)) = v.get(target_idx) {
+                    let v = *f as f64;
+                    if v.is_finite() {
+                        hist.insert(v);
+                    }
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
 
 pub struct SketchAccumulator {
     pub sample_ids: Vec<String>,
@@ -18,6 +65,7 @@ pub struct SketchAccumulator {
     hom_alt: Vec<BitVec<u64, Lsb0>>,
     dp_sums: Vec<u64>,
     dp_counts: Vec<u64>,
+    info_histograms: Vec<InfoHistogram>,
 }
 
 impl SketchAccumulator {
@@ -33,6 +81,7 @@ impl SketchAccumulator {
             hom_alt: vec![BitVec::new(); n],
             dp_sums: vec![0u64; n],
             dp_counts: vec![0u64; n],
+            info_histograms: Vec::new(),
         }
     }
 
@@ -130,6 +179,37 @@ impl SketchAccumulator {
 
         self.positions.push((contig_rank as u32, pos));
         self.n_sites += 1;
+
+        let info = buf.info();
+        for entry in &mut self.info_histograms {
+            let target_idx = match entry.number {
+                InfoNumber::ReferenceAlternateBases => 1usize,
+                _ => 0usize,
+            };
+            if let Some(Some(val)) = info.get(&entry.name) {
+                insert_info_value(val, &mut entry.hist, target_idx);
+            }
+        }
+    }
+
+    pub fn init_info_histograms(&mut self, header: &vcf::Header, bin_count: usize) {
+        for (name, map) in header.infos() {
+            let number = map.number();
+            if matches!(number, InfoNumber::Samples) {
+                continue;
+            }
+            let ty = map.ty();
+            if !matches!(ty, vcf::header::record::value::map::info::Type::Integer
+                | vcf::header::record::value::map::info::Type::Float)
+            {
+                continue;
+            }
+            self.info_histograms.push(InfoHistogram {
+                name: name.clone(),
+                number,
+                hist: StreamHist::with_capacity(bin_count),
+            });
+        }
     }
 
     pub fn compute_pair_stats(&self, i: usize, j: usize) -> (u64, u64, f64) {
@@ -351,6 +431,23 @@ impl SketchAccumulator {
             w.write_record(row)?;
         }
 
+        w.flush()?;
+        Ok(())
+    }
+
+    pub fn write_info_stats_csv<W: Write>(&self, writer: W) -> Result<()> {
+        let mut w = csv::Writer::from_writer(writer);
+        w.write_record(["field", "bin_mean", "count"])?;
+        for entry in &self.info_histograms {
+            for bin in &entry.hist.bins {
+                let (mean, count): (f64, u64) = bin.into();
+                w.write_record([
+                    entry.name.as_str(),
+                    &format!("{:.6}", mean),
+                    &count.to_string(),
+                ])?;
+            }
+        }
         w.flush()?;
         Ok(())
     }

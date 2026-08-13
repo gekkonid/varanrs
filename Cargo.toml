@@ -24,6 +24,7 @@ thiserror = "1"
 bitvec = "1"
 csv = "1"
 indexmap = "2"
+histr = { git = "https://github.com/twolodzko/histr.git" }
 
 [dev-dependencies]
 tempfile = "3"
