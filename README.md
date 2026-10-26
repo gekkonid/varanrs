@@ -180,11 +180,4 @@ bcftools view -Ou in.bcf | varanrs uppercase-alleles | bcftools view -Oz -o out.
 
 # Install/Build
 
-
-Clone, then 
-
-```
-cargo build --release
-```
-
-and the binary will be in `target/release/varanrs`
+Precompiled binaries are [available on github releases](https://github.com/gekkonid/varanrs/releases). If these don't work, you'll have to install from source with cargo: Clone this repo, then run `cargo build --release` and the binary will be in `target/release/varanrs`. If you don't have cargo, see [rustup](https://rustup.rs/).
