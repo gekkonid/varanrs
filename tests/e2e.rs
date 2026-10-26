@@ -21,6 +21,8 @@ use noodles_util::variant;
 use noodles_vcf::variant::RecordBuf;
 use varanrs::processor::ParallelVariantWindowProcessor;
 
+mod common;
+
 /// Path to the testdata directory (relative to crate root).
 const TESTDATA_DIR: &str = "tests/testdata";
 
@@ -131,15 +133,6 @@ fn discover_test_files() -> Vec<PathBuf> {
     }
     files.sort();
     files
-}
-
-/// Check whether `bcftools` is available on PATH.
-fn bcftools_available() -> bool {
-    Command::new("bcftools")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// Run `bcftools view <input>` and stream the uncompressed VCF lines to a
@@ -350,8 +343,7 @@ fn compare_vcf_headers(
 /// preserved with identical content and ordering.
 #[test]
 fn e2e_identity_matches_bcftools_view() {
-    if !bcftools_available() {
-        eprintln!("SKIP: bcftools not available");
+    if !common::check_tools(&["bcftools", "bgzip"]) {
         return;
     }
 
@@ -391,6 +383,10 @@ fn e2e_identity_matches_bcftools_view() {
 /// then by position within each contig.
 #[test]
 fn e2e_output_is_globally_ordered() {
+    if !common::check_tools(&["bgzip"]) {
+        return;
+    }
+
     let test_files = discover_test_files();
     if test_files.is_empty() {
         panic!("No .vcf.gz files found in {}", TESTDATA_DIR);
@@ -534,6 +530,10 @@ fn e2e_parallel_thread_count_equivalence() {
 /// crossings.
 #[test]
 fn e2e_no_duplicate_records_at_boundaries() {
+    if !common::check_tools(&["bgzip"]) {
+        return;
+    }
+
     let test_files = discover_test_files();
     if test_files.is_empty() {
         panic!("No .vcf.gz files found in {}", TESTDATA_DIR);
@@ -577,6 +577,10 @@ fn e2e_no_duplicate_records_at_boundaries() {
 /// Uses default window size — a simpler sanity check.
 #[test]
 fn e2e_record_count_preserved() {
+    if !common::check_tools(&["bgzip"]) {
+        return;
+    }
+
     let test_files = discover_test_files();
     if test_files.is_empty() {
         panic!("No .vcf.gz files found in {}", TESTDATA_DIR);
@@ -621,8 +625,7 @@ fn e2e_record_count_preserved() {
 /// varanrs output.
 #[test]
 fn e2e_header_metadata_preserved() {
-    if !bcftools_available() {
-        eprintln!("SKIP: bcftools not available");
+    if !common::check_tools(&["bcftools", "bgzip"]) {
         return;
     }
 

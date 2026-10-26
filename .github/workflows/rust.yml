@@ -32,6 +32,7 @@ jobs:
           -e OPENBLAS_TARGET \
           -e OPENSSL_VENDORED=1 \
           -e OPENSSL_STATIC=1 \
+          -e ERROR_ON_MISSING_BCFTOOLS=1 \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           quay.io/pypa/manylinux2014_x86_64 \
@@ -66,10 +67,14 @@ jobs:
         key: linux-aarch64-${{ matrix.rust }}
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev tabix
+      run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev tabix bcftools
 
     - name: Build
       run: cargo build --verbose --release
+
+    - name: Set missing bcftools env
+      run: |
+        echo "ERROR_ON_MISSING_BCFTOOLS=1" >> $GITHUB_ENV
 
     - name: Run tests
       run: cargo test --verbose --release
@@ -104,7 +109,7 @@ jobs:
         key: macos-universal-${{ matrix.rust }}
 
     - name: Install dependencies
-      run: brew install openblas gfortran
+      run: brew install openblas gfortran 
 
     - name: Set OPENBLAS env
       run: |

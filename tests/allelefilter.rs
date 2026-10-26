@@ -5,6 +5,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
+mod common;
+
 fn run_filter(input: &Path, output: &Path, min_ac: Option<u32>, min_af: Option<f64>) -> Result<()> {
     let args = varanrs::commands::allelefilter::AllelefilterArgs {
         input: Some(input.display().to_string()),
@@ -360,8 +362,7 @@ chr1\t200\t.\tG\tC\t.\t.\t.\tGT\t1/1\t0/1
 fn stdin_filter_from_bcf_pipe() -> Result<()> {
     use std::process::{Command, Stdio};
 
-    if !Command::new("bcftools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
-        eprintln!("SKIP: bcftools not available");
+    if !common::check_tools(&["bcftools"]) {
         return Ok(());
     }
 

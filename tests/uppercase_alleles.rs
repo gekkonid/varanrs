@@ -8,6 +8,8 @@ use anyhow::Result;
 use noodles_util::variant;
 use noodles_vcf as vcf;
 
+mod common;
+
 fn write_indexed_vcf(path: &Path, text: &str) {
     let raw = path.with_extension("tmp.vcf");
     File::create(&raw).unwrap().write_all(text.as_bytes()).unwrap();
@@ -29,6 +31,10 @@ fn write_indexed_vcf(path: &Path, text: &str) {
 
 #[test]
 fn upper_command_uppercases_alleles_round_trip() -> Result<()> {
+    if !common::check_tools(&["bgzip", "tabix"]) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     let output = dir.path().join("out.vcf.gz");
@@ -111,8 +117,7 @@ chr1\t200\t.\tc\tG,a\t.\t.\t.\tGT\t1/2
 fn stdin_upper_from_bcf_pipe() -> Result<()> {
     use std::process::{Command, Stdio};
 
-    if !Command::new("bcftools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
-        eprintln!("SKIP: bcftools not available");
+    if !common::check_tools(&["bcftools"]) {
         return Ok(());
     }
 

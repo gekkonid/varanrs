@@ -10,6 +10,11 @@ use noodles_util::variant;
 use noodles_vcf as vcf;
 use varanrs::processor::ParallelVariantWindowProcessor;
 
+mod common;
+
+const INDEX_TOOLS: &[&str] = &["bgzip", "tabix"];
+const BCF_TOOLS: &[&str] = &["bgzip", "tabix", "bcftools"];
+
 /// Create a real `.vcf.gz` (bgzipped + tabix-indexed) at `path`.
 ///
 /// Uses the system `bgzip` and `tabix` binaries. The caller passes the *uncompressed* VCF text;
@@ -83,6 +88,10 @@ fn build_simple_input(path: &Path) {
 
 #[test]
 fn identity_round_trip() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     let output = dir.path().join("out.vcf.gz");
@@ -104,6 +113,10 @@ fn identity_round_trip() -> Result<()> {
 
 #[test]
 fn filtering_drops_records() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     let output = dir.path().join("out.vcf.gz");
@@ -136,6 +149,10 @@ fn filtering_drops_records() -> Result<()> {
 
 #[test]
 fn header_callback_is_applied_to_output_header() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     use vcf::header::record::value::{Map, map::Info};
     use vcf::header::record::value::map::info::{Number, Type};
 
@@ -166,6 +183,10 @@ fn header_callback_is_applied_to_output_header() -> Result<()> {
 
 #[test]
 fn output_is_globally_ordered_under_parallelism() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     let output = dir.path().join("out.vcf.gz");
@@ -194,6 +215,10 @@ fn output_is_globally_ordered_under_parallelism() -> Result<()> {
 
 #[test]
 fn boundary_record_is_not_duplicated() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     let output = dir.path().join("out.vcf.gz");
@@ -224,6 +249,10 @@ fn boundary_record_is_not_duplicated() -> Result<()> {
 
 #[test]
 fn progress_callback_reports_cumulative_bp() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     let output = dir.path().join("out.vcf.gz");
@@ -254,6 +283,10 @@ fn progress_callback_reports_cumulative_bp() -> Result<()> {
 
 #[test]
 fn iterates_without_writing_when_no_output_set() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -283,6 +316,10 @@ fn iterates_without_writing_when_no_output_set() -> Result<()> {
 
 #[test]
 fn no_output_still_fires_progress_in_window_order() -> Result<()> {
+    if !common::check_tools(INDEX_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.vcf.gz");
     build_simple_input(&input);
@@ -324,6 +361,10 @@ fn write_indexed_bcf(path: &Path, vcf_gz_path: &Path) {
 
 #[test]
 fn identity_round_trip_with_symbolic_alleles() -> Result<()> {
+    if !common::check_tools(BCF_TOOLS) {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let input_gz = dir.path().join("in.vcf.gz");
     let output_gz = dir.path().join("out.vcf.gz");
@@ -389,6 +430,10 @@ chr1\t700\t.\tT\tC,A\t.\t.\t.\tGT\t0/1\t1/2
 
 #[test]
 fn glnexus_rnc_normalize_header_fix() -> Result<()> {
+    if !common::check_tools(BCF_TOOLS) {
+        return Ok(());
+    }
+
     // GLnexus declares RNC as Type=Character,Number=2 but encodes "II"
     // as a single string in BCF.  The raw VCF can't be read by RecordBuf
     // conversion without the header fix — read_records on the input should
