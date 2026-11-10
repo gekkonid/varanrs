@@ -9,7 +9,7 @@ VARiant ANalysis in RuSt
 
 This toolkit consists of several tools for VCF/BCF manipulation:
 
-* [`varanrs snpsketch`](#snpsketch): generate a very fast, parallelised summary of a huge VCF/BCF, reporting sample stats (missingness, het rate, depth), inter-sample distances, and snp-level summaries (histograms over any numeric INFO/XXXX fields). Optionally outputs a subset of variants in an R-freindly CSV
+* [`varanrs snpsketch`](#snpsketch): generate a summary of a huge VCF/BCF, reporting sample stats, inter-sample distances, and snp-level summaries in a very fast, parallelised manner. Optionally outputs a subset of variants in an R-freindly CSV
 
 * [`varanrs allelefilter`](#allelefilter): separately filter each ALT allele of a VCF, on MAC/MAF. At multiallelic sites, removes alleles individually, returning to an N-1-allelic site (e.g. drops a very rare third allele, yielding a bialelleic site with missing data where the third allele was).
 
