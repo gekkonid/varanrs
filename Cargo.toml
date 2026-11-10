@@ -12,10 +12,11 @@ name = "varanrs"
 path = "src/main.rs"
 
 [dependencies]
-noodles-util = { version = "0.78", features = ["variant"] }
-noodles-vcf = "0.87"
+rust-htslib = { version = "1.0", default-features = false, features = ["static", "libdeflate"] }
+# Direct dependency so build.rs receives DEP_HTS_INCLUDE (htslib headers) for
+# compiling the vendored bcftools filter.c.
+hts-sys = { version = "2.2", default-features = false, features = ["static", "libdeflate"] }
 noodles-bgzf = "0.46"
-noodles-core = "0.19"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 crossbeam-channel = "0.5"
@@ -25,6 +26,9 @@ bitvec = "1"
 csv = "1"
 indexmap = "2"
 histr = { git = "https://github.com/twolodzko/histr.git" }
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 tempfile = "3"

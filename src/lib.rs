@@ -4,7 +4,9 @@
 
 pub mod args;
 pub mod commands;
+pub mod filltags;
 pub mod filter;
+pub mod hts;
 pub mod processor;
 pub mod snpsketch;
 pub mod util;

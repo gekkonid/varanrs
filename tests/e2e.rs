@@ -17,8 +17,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use noodles_util::variant;
-use noodles_vcf::variant::RecordBuf;
 use varanrs::processor::ParallelVariantWindowProcessor;
 
 mod common;
@@ -207,7 +205,7 @@ fn run_varanrs_identity(input: &Path, output: &Path, worker_threads: usize) {
         .with_output_file(output)
         .worker_threads(worker_threads)
         .window_size(varanrs::processor::DEFAULT_WINDOW_SIZE)
-        .record_callback(Some)
+        .record_callback(|_| true)
         .run()
         .unwrap_or_else(|e| {
             panic!("varanrs processor failed on {}: {}", input.display(), e)
@@ -226,7 +224,7 @@ fn run_varanrs_identity_with_window(
         .with_output_file(output)
         .worker_threads(worker_threads)
         .window_size(window_size)
-        .record_callback(Some)
+        .record_callback(|_| true)
         .run()
         .unwrap_or_else(|e| {
             panic!(
@@ -407,49 +405,26 @@ fn e2e_output_is_globally_ordered() {
         // Run with small window size to maximize reordering stress
         run_varanrs_identity_with_window(test_file, &output, 4, 1000);
 
-        // Get contig order from input header
-        let mut input_reader = if test_file.extension().is_some_and(|e| e == "gz") {
-            let tmp_vcf = tmpdir.path().join("read_input.vcf");
-            let status = Command::new("bgzip")
-                .args(["-d", "-c"])
-                .arg(test_file)
-                .stdout(File::create(&tmp_vcf).unwrap())
-                .status()
-                .unwrap();
-            assert!(status.success());
-            variant::io::reader::Builder::default()
-                .build_from_path(&tmp_vcf)
-                .unwrap()
-        } else {
-            variant::io::reader::Builder::default()
-                .build_from_path(test_file)
-                .unwrap()
-        };
-        let header = input_reader.read_header().unwrap();
-        let contig_order: Vec<String> = header
-            .contigs()
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect();
+        // Contig order of the input file (records appear contig by
+        // contig); the output must follow the same file order.
+        let (_, input_records) = varanrs::hts::read_all(test_file.to_str().unwrap()).unwrap();
+        let mut contig_order: Vec<String> = Vec::new();
+        for r in &input_records {
+            let c = varanrs::hts::rec_contig(r);
+            if contig_order.last() != Some(&c) {
+                contig_order.push(c);
+            }
+        }
 
-        // Decompress output for reading
-        let output_decompressed = bgzip_decompress_to_file(&output, tmpdir.path());
-        let mut output_reader = variant::io::reader::Builder::default()
-            .build_from_path(&output_decompressed)
-            .unwrap();
-        let out_header = output_reader.read_header().unwrap();
+        let (_, output_records) = varanrs::hts::read_all(output.to_str().unwrap()).unwrap();
 
         let mut prev_contig_idx: Option<usize> = None;
         let mut prev_pos: usize = 0;
         let mut record_count = 0;
 
-        for result in output_reader.records(&out_header) {
-            let record = result.unwrap();
-            let buf: RecordBuf =
-                RecordBuf::try_from_variant_record(&out_header, record.as_ref()).unwrap();
-
-            let chrom = buf.reference_sequence_name().to_string();
-            let pos = buf.variant_start().map(|p| p.get()).unwrap_or(0);
+        for rec in &output_records {
+            let chrom = varanrs::hts::rec_contig(rec);
+            let pos = rec.pos() as usize + 1;
 
             let contig_idx = contig_order
                 .iter()
@@ -459,7 +434,7 @@ fn e2e_output_is_globally_ordered() {
             if let Some(prev_ci) = prev_contig_idx {
                 if contig_idx < prev_ci {
                     panic!(
-                        "{}: record {} (contig '{}' idx {}) appeared after '{}' idx {} — not in header order",
+                        "{}: record {} (contig '{}' idx {}) appeared after '{}' idx {} — not in file order",
                         basename, record_count, chrom, contig_idx,
                         contig_order.get(prev_ci).map(|s| s.as_str()).unwrap_or(""),
                         prev_ci

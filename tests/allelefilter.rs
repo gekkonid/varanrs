@@ -41,6 +41,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\t.\tGT\t0/1\t0/2\t1/1\t0/0\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -74,6 +75,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\t.\tGT\t0/1\t0/2\t1/1\t0/0\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -105,6 +107,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\t.\tGT\t0/1\t0/2\t1/1\t0/0\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -135,6 +138,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\t.\tGT\t0/1\t0/2\t1/1\t0/0\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -165,6 +169,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\t.\tGT\t0/1\t0/2\t1/1\t0/0\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -196,6 +201,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\t.\tGT:AD\t0/1:10,5,2\t0/2:8,3,1\t1/1:6,4,0\t0/0:12,0
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -229,6 +235,7 @@ chr1\t100\t.\tA\tC,T\t.\t.\tDUMMY_R=100,50,20\tGT\t0/1\t0/2\t1/1\t0/0\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
@@ -257,6 +264,7 @@ chr1\t100\t.\tA\t.\t.\t.\t.\tGT\t0/0\t0/0\t./.\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
 chr1\t100\t.\tA\t.\t.\t.\tAN=4\tGT\t0/0\t0/0\t./.\n";
@@ -286,6 +294,7 @@ chr1\t300\t.\tT\tC\t.\t.\t.\tGT\t1/1\t1/1\t1/1\t1/1\n";
 
     let out = read_text(&output);
     let expected = "##fileformat=VCFv4.2\n\
+##FILTER=<ID=PASS,Description=\"All filters passed\">\n\
 ##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">\n\
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
 ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">\n\

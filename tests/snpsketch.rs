@@ -1,31 +1,30 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
-use noodles_vcf as vcf;
-use vcf::variant::RecordBuf;
+use rust_htslib::bcf::Record;
 
+use varanrs::hts::{self, HeaderView};
 use varanrs::snpsketch::SketchAccumulator;
 
-fn parse_vcf_text(vcf_text: &str) -> (vcf::Header, Vec<RecordBuf>) {
-    let mut reader = vcf::io::reader::Builder::default()
-        .build_from_reader(Cursor::new(vcf_text.as_bytes().to_vec()))
-        .unwrap();
-    let header = reader.read_header().unwrap();
-    let mut records = Vec::new();
-    for result in reader.record_bufs(&header) {
-        records.push(result.unwrap());
-    }
-    (header, records)
+fn parse_vcf_text(vcf_text: &str) -> (Arc<HeaderView>, Vec<Record>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.vcf");
+    std::fs::write(&path, vcf_text).unwrap();
+    hts::read_all(path.to_str().unwrap()).unwrap()
 }
 
 fn make_acc_from_vcf(vcf_text: &str) -> SketchAccumulator {
     let (header, records) = parse_vcf_text(vcf_text);
-    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: IndexMap<String, usize> = header
-        .contigs()
+    let sample_ids: Vec<String> = header
+        .samples()
         .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let contig_rank: IndexMap<String, usize> = hts::header_contigs(&header)
+        .into_iter()
         .enumerate()
-        .map(|(i, (name, _))| (name.to_string(), i))
+        .map(|(i, (name, _))| (name, i))
         .collect();
     let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
     for rec in &records {
@@ -67,12 +66,15 @@ chr1	100	.	A	G	.	.	.	GT	0/0	0/1	1/1	./.
 ";
 
     let (header, records) = parse_vcf_text(vcf);
-    let ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: IndexMap<String, usize> = header
-        .contigs()
+    let ids: Vec<String> = header
+        .samples()
         .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let contig_rank: IndexMap<String, usize> = hts::header_contigs(&header)
+        .into_iter()
         .enumerate()
-        .map(|(i, (name, _))| (name.to_string(), i))
+        .map(|(i, (name, _))| (name, i))
         .collect();
     let mut acc = SketchAccumulator::new(ids, contig_rank);
     acc.process_record(&records[0]);
@@ -471,12 +473,15 @@ chr1	100	.	A	G	.	.	AC=5;AN=10;AF=0.5;MQ=60.0;DB	GT	0/1
 chr1	200	.	C	T	.	.	AC=3;AN=8;AF=0.375;MQ=45.0	GT	0/1
 ";
     let (header, records) = parse_vcf_text(vcf);
-    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: IndexMap<String, usize> = header
-        .contigs()
+    let sample_ids: Vec<String> = header
+        .samples()
         .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let contig_rank: IndexMap<String, usize> = hts::header_contigs(&header)
+        .into_iter()
         .enumerate()
-        .map(|(i, (name, _))| (name.to_string(), i))
+        .map(|(i, (name, _))| (name, i))
         .collect();
     let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
     acc.init_info_histograms(&header, 100);
@@ -509,12 +514,15 @@ fn info_stats_csv_number_r_takes_index_one() {
 chr1	100	.	A	G	.	.	BaseQRankSum=1.1,2.2	GT	0/1
 ";
     let (header, records) = parse_vcf_text(vcf);
-    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: IndexMap<String, usize> = header
-        .contigs()
+    let sample_ids: Vec<String> = header
+        .samples()
         .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let contig_rank: IndexMap<String, usize> = hts::header_contigs(&header)
+        .into_iter()
         .enumerate()
-        .map(|(i, (name, _))| (name.to_string(), i))
+        .map(|(i, (name, _))| (name, i))
         .collect();
     let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
     acc.init_info_histograms(&header, 100);
@@ -542,12 +550,15 @@ fn info_stats_no_numeric_fields() {
 chr1	100	.	A	G	.	.	DB	GT	0/1
 ";
     let (header, _records) = parse_vcf_text(vcf);
-    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
-    let contig_rank: IndexMap<String, usize> = header
-        .contigs()
+    let sample_ids: Vec<String> = header
+        .samples()
         .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let contig_rank: IndexMap<String, usize> = hts::header_contigs(&header)
+        .into_iter()
         .enumerate()
-        .map(|(i, (name, _))| (name.to_string(), i))
+        .map(|(i, (name, _))| (name, i))
         .collect();
     let mut acc = SketchAccumulator::new(sample_ids, contig_rank);
     acc.init_info_histograms(&header, 100);

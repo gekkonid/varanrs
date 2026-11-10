@@ -1,12 +1,22 @@
 //! Parallel, regioned variant processor.
 //!
-//! Reads an indexed VCF/BCF, splits each contig into fixed-size windows, and
-//! processes the windows in parallel: each worker opens its own indexed reader,
-//! queries its assigned region, applies a user-supplied callback to every
-//! record, and serializes the results to an in-memory uncompressed VCF buffer.
-//! The main thread re-orders the per-window buffers and feeds them to a
-//! `bgzf::MultithreadedWriter` so the output is correctly ordered and
-//! bgzf-compressed in parallel.
+//! Reads an indexed VCF/BCF (htslib), splits each contig into fixed-size
+//! windows, and processes the windows in parallel: each worker opens its own
+//! indexed reader, queries its assigned region, applies a per-worker record
+//! function to every record, and serialises the kept records to an in-memory
+//! VCF text buffer (htslib `vcf_format`, so byte-identical to bcftools). The
+//! main thread re-orders the per-window buffers and feeds them to a
+//! multithreaded BGZF writer, so the output is correctly ordered and
+//! compressed in parallel.
+//!
+//! Contigs are processed in file order (the order of their data in the
+//! index), matching `bcftools view`.
+//!
+//! Memory is bounded: a window is only dispatched once it holds one of
+//! `max_in_flight` permits (default 2 × worker threads), and the permit is
+//! returned only after the window has been written in order. So at most
+//! `max_in_flight` windows exist at once, whether queued, being processed, or
+//! waiting in the re-order buffer, however slow any single window is.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -19,124 +29,56 @@ use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
 use indexmap::IndexMap;
 use noodles_bgzf as bgzf;
-use noodles_core::{Position, Region};
-use noodles_util::variant;
-use noodles_vcf as vcf;
-use vcf::variant::RecordBuf;
-use vcf::variant::io::Write as _;
+use rust_htslib::bcf::Record;
 
-#[allow(dead_code)]
-fn dump_record_fields(record: &dyn vcf::variant::Record, header: &vcf::Header) -> String {
-    use std::fmt::Write;
+use crate::hts::{self, HeaderView, KString, SampleSubset, VcfReader};
 
-    let chrom = record
-        .reference_sequence_name(header)
-        .unwrap_or("<err>");
-    let pos = match record.variant_start() {
-        Some(Ok(p)) => p.get().to_string(),
-        _ => String::from("."),
-    };
+/// Default per-window size, in base pairs: 2^14, one tabix/CSI linear-index
+/// bin (min_shift = 14).
+pub const DEFAULT_WINDOW_SIZE: u64 = 16_384;
 
-    let mut ref_bases = String::new();
-    for b in record.reference_bases().iter() {
-        match b {
-            Ok(c) => ref_bases.push(c as char),
-            Err(_) => ref_bases.push_str("<err>"),
-        }
-    }
-    if ref_bases.is_empty() {
-        ref_bases.push('.');
-    }
+/// Contig positions are 1-based `i32` in VCF/BCF; windows beyond a contig's
+/// declared length are searched (via the index) up to this position.
+const MAX_POS: u64 = i32::MAX as u64;
 
-    let mut alts = String::new();
-    for (i, a) in record.alternate_bases().iter().enumerate() {
-        if i > 0 {
-            alts.push(',');
-        }
-        match a {
-            Ok(s) => alts.push_str(s),
-            Err(_) => alts.push_str("<err>"),
-        }
-    }
-    if alts.is_empty() {
-        alts.push('.');
-    }
-
-    let qual = match record.quality_score() {
-        Some(Ok(q)) => format!("{q}"),
-        _ => String::from("."),
-    };
-
-    let mut buf = String::new();
-    write!(buf, "record dump: {chrom}\t{pos}\t.\t{ref_bases}\t{alts}\t{qual}\t.\t").ok();
-
-    let info = record.info();
-    let iter = info.iter(header);
-    {
-        let mut first = true;
-        for result in iter {
-            match result {
-                Ok((key, value)) => {
-                    if !first { buf.push(';'); }
-                    first = false;
-                    match value {
-                        Some(v) => write!(buf, "{key}={v:?}").ok(),
-                        None => write!(buf, "{key}").ok(),
-                    };
-                }
-                Err(e) => {
-                    if !first { buf.push(';'); }
-                    first = false;
-                    write!(buf, "<info_field_err:{e}>").ok();
-                }
-            }
-        }
-        if first { buf.push('.'); }
-    }
-
-    // FORMAT + sample summary
-    match record.samples() {
-        Ok(samples) => {
-            let keys = samples.column_names(header);
-            write!(buf, "\t").ok();
-            let mut first = true;
-            for k in keys {
-                if !first { buf.push(':'); }
-                first = false;
-                match k {
-                    Ok(name) => { buf.push_str(name); }
-                    Err(_) => { buf.push_str("<err>"); }
-                }
-            }
-            write!(buf, "\t{} samples", samples.len()).ok();
-        }
-        Err(e) => {
-            write!(buf, "\t<samples_err:{e}>").ok();
-        }
-    }
-
-    buf
-}
-
-/// Default per-window size, in base pairs.
-pub const DEFAULT_WINDOW_SIZE: u64 = 1_000_000;
-
-type RecordCallback = dyn Fn(RecordBuf) -> Option<RecordBuf> + Send + Sync + 'static;
+/// A per-worker record function: `Ok(true)` keeps (writes) the record,
+/// `Ok(false)` drops it, `Err` aborts the run.
+pub type RecordFn = Box<dyn FnMut(&mut Record) -> Result<bool>>;
+type RecordFactory = dyn Fn(&Arc<HeaderView>) -> Result<RecordFn> + Send + Sync;
 type ProgressCallback = dyn Fn(u64, usize, usize) + Send + Sync + 'static;
-type HeaderCallback = Box<dyn FnOnce(&mut vcf::Header) + Send + 'static>;
 
-/// One contiguous slice of a single contig.
+/// One unit of work, in output order: either a window to query, or a span of
+/// windows the index proves to be empty (nothing is read for it).
 #[derive(Clone, Debug)]
 struct Window {
+    /// Sequential item index, used to re-order output.
     idx: usize,
-    contig: Box<str>,
+    contig: Arc<str>,
     start: u64,
     end: u64,
+    /// Number of (stride-selected) windows this item stands for.
+    n_windows: usize,
+    /// Base pairs of those windows, for progress reporting.
+    bp: u64,
+    /// True when the index shows no record can overlap this span.
+    skip: bool,
 }
 
-impl Window {
-    fn bp(&self) -> u64 {
-        self.end - self.start + 1
+/// A contig to process, with its window numbering.
+#[derive(Clone, Debug)]
+struct ContigPlan {
+    name: Arc<str>,
+    /// Declared length (header or .fai); 0 when unknown. Records beyond it
+    /// are still processed, but do not count towards progress totals.
+    length: u64,
+    /// Absolute index (across all contigs) of this contig's first window,
+    /// used for stride selection.
+    first_abs: usize,
+}
+
+impl ContigPlan {
+    fn n_windows(&self, window_size: u64) -> usize {
+        self.length.div_ceil(window_size) as usize
     }
 }
 
@@ -146,12 +88,14 @@ pub struct ParallelVariantWindowProcessorBuilder {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     worker_threads: Option<usize>,
+    max_in_flight: Option<usize>,
     window_size: Option<u64>,
     stride: Option<usize>,
     contig_filter: Option<HashSet<String>>,
     contig_lengths: Option<IndexMap<String, u64>>,
-    record_callback: Option<Arc<RecordCallback>>,
-    header_callback: Option<HeaderCallback>,
+    record_factory: Option<Arc<RecordFactory>>,
+    header_lines: Vec<String>,
+    samples: Option<SampleSubset>,
     progress_callback: Option<Arc<ProgressCallback>>,
 }
 
@@ -162,8 +106,8 @@ impl ParallelVariantWindowProcessorBuilder {
     }
 
     /// Set the output `.vcf.gz` path. Optional: when omitted, the processor
-    /// runs in side-effect-only mode — workers apply `record_callback` to
-    /// every variant but no VCF is written and records aren't serialized.
+    /// runs in side-effect-only mode — workers apply the record function to
+    /// every variant but no VCF is written and records aren't serialised.
     pub fn with_output_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.output = Some(path.into());
         self
@@ -171,6 +115,14 @@ impl ParallelVariantWindowProcessorBuilder {
 
     pub fn worker_threads(mut self, n: usize) -> Self {
         self.worker_threads = Some(n);
+        self
+    }
+
+    /// Maximum number of windows held in memory at once (queued, being
+    /// processed, or awaiting in-order output). Default `2 * worker_threads`;
+    /// values below `worker_threads` are raised to it.
+    pub fn max_in_flight(mut self, n: usize) -> Self {
+        self.max_in_flight = Some(n);
         self
     }
 
@@ -200,21 +152,40 @@ impl ParallelVariantWindowProcessorBuilder {
         self
     }
 
-    /// Required. Applied to each `RecordBuf`; `Some(buf)` is written, `None` drops the record.
-    pub fn record_callback<F>(mut self, f: F) -> Self
+    /// Per-worker record function factory. Called once in each worker thread
+    /// with that worker's header (which already contains `header_lines`).
+    pub fn record_factory<F>(mut self, f: F) -> Self
     where
-        F: Fn(RecordBuf) -> Option<RecordBuf> + Send + Sync + 'static,
+        F: Fn(&Arc<HeaderView>) -> Result<RecordFn> + Send + Sync + 'static,
     {
-        self.record_callback = Some(Arc::new(f));
+        self.record_factory = Some(Arc::new(f));
         self
     }
 
-    /// Optional. Mutates the input header before it's written to the output.
-    pub fn header_callback<F>(mut self, f: F) -> Self
+    /// Convenience for stateless functions: `true` keeps the record.
+    pub fn record_callback<F>(self, f: F) -> Self
     where
-        F: FnOnce(&mut vcf::Header) + Send + 'static,
+        F: Fn(&mut Record) -> bool + Send + Sync + 'static,
     {
-        self.header_callback = Some(Box::new(f));
+        let f = Arc::new(f);
+        self.record_factory(move |_h| {
+            let f = Arc::clone(&f);
+            Ok(Box::new(move |r: &mut Record| Ok(f(r))) as RecordFn)
+        })
+    }
+
+    /// Optional. `##` header lines appended to the output header (and to the
+    /// header records are parsed with, so new INFO/FORMAT/FILTER IDs exist).
+    pub fn header_lines(mut self, lines: Vec<String>) -> Self {
+        self.header_lines = lines;
+        self
+    }
+
+    /// Optional. Subset samples as each record is read, before the record
+    /// function sees it (the header lines are then appended to the subset
+    /// header).
+    pub fn samples(mut self, samples: Option<SampleSubset>) -> Self {
+        self.samples = samples;
         self
     }
 
@@ -235,22 +206,28 @@ impl ParallelVariantWindowProcessorBuilder {
             .worker_threads
             .ok_or_else(|| anyhow!("missing worker_threads"))?
             .max(1);
+        let max_in_flight = self
+            .max_in_flight
+            .unwrap_or(2 * worker_threads)
+            .max(worker_threads);
         let window_size = self.window_size.unwrap_or(DEFAULT_WINDOW_SIZE).max(1);
         let stride = self.stride.unwrap_or(1).max(1);
-        let record_callback = self
-            .record_callback
-            .ok_or_else(|| anyhow!("missing record_callback"))?;
+        let record_factory = self
+            .record_factory
+            .ok_or_else(|| anyhow!("missing record_callback/record_factory"))?;
 
         ParallelVariantWindowProcessor {
             input,
             output: self.output,
             worker_threads,
+            max_in_flight,
             window_size,
             stride,
             contig_filter: self.contig_filter,
             contig_lengths: self.contig_lengths,
-            record_callback,
-            header_callback: self.header_callback,
+            record_factory,
+            header_lines: self.header_lines,
+            samples: self.samples,
             progress_callback: self.progress_callback,
         }
         .execute()
@@ -261,12 +238,14 @@ pub struct ParallelVariantWindowProcessor {
     input: PathBuf,
     output: Option<PathBuf>,
     worker_threads: usize,
+    max_in_flight: usize,
     window_size: u64,
     stride: usize,
     contig_filter: Option<HashSet<String>>,
     contig_lengths: Option<IndexMap<String, u64>>,
-    record_callback: Arc<RecordCallback>,
-    header_callback: Option<HeaderCallback>,
+    record_factory: Arc<RecordFactory>,
+    header_lines: Vec<String>,
+    samples: Option<SampleSubset>,
     progress_callback: Option<Arc<ProgressCallback>>,
 }
 
@@ -280,47 +259,31 @@ impl ParallelVariantWindowProcessor {
             input,
             output,
             worker_threads,
+            max_in_flight,
             window_size,
             stride,
             contig_filter,
             contig_lengths,
-            record_callback,
-            header_callback,
+            record_factory,
+            header_lines,
+            samples,
             progress_callback,
         } = self;
 
-        // 1. Open input + read header. Capture the set of contigs the index
-        //    actually knows about so we can skip header-declared contigs that
-        //    aren't represented in the file (the query would otherwise error).
-        //    Tabix exposes this via `index.header().reference_sequence_names()`;
-        //    CSI (BCF) returns `None` and we fall back to no pre-filtering.
-        let mut reader = variant::io::indexed_reader::Builder::default()
-            .build_from_path(&input)
-            .with_context(|| format!("failed to open indexed reader: {}", input.display()))?;
-        let mut input_header = reader.read_header().context("failed to read header")?;
-        crate::util::normalize_header_for_noodles(&mut input_header);
-        let indexed_contigs: Option<std::collections::HashSet<Vec<u8>>> = reader
-            .index()
-            .header()
-            .map(|h| h.reference_sequence_names().iter().map(|b| b.to_vec()).collect());
-        drop(reader); // workers each open their own.
-
-        // 2. Build output header.
-        let mut output_header = input_header.clone();
-        if let Some(cb) = header_callback {
-            cb(&mut output_header);
+        // 1. Open the input, build the output header and plan contigs.
+        let mut reader = VcfReader::open_indexed(&input)?;
+        if let Some(s) = samples.as_ref() {
+            reader.subset_samples(s)?;
         }
-        let input_header = Arc::new(input_header);
-        let output_header = Arc::new(output_header);
+        reader.append_header_lines(&header_lines)?;
+        let header_text = hts::format_header(reader.header())?;
+        let contigs = plan_contigs(&reader, window_size, contig_filter.as_ref(), contig_lengths.as_ref());
+        drop(reader); // workers and the producer each open their own.
+        let total_abs: usize = contigs.last().map_or(0, |c| c.first_abs + c.n_windows(window_size));
+        let total_windows = total_abs.div_ceil(stride);
 
-        // 3. Enumerate windows from the input header's contigs.
-        let windows = enumerate_windows(&input_header, window_size, stride, indexed_contigs.as_ref(), contig_filter.as_ref(), contig_lengths.as_ref());
-
-        // 4. Open output and write the header through a multithreaded bgzf
-        //    writer. If no output path was provided, run in side-effect-only
-        //    mode: workers still apply `record_callback` (so the user can
-        //    accumulate state, count, push to a channel, etc.), but no bytes
-        //    are serialized or written.
+        // 2. Open output and write the header through a multithreaded bgzf
+        //    writer. Without an output path, run in side-effect-only mode.
         let mut mt_writer = match output.as_ref() {
             Some(path) => {
                 let file = File::create(path)
@@ -328,134 +291,153 @@ impl ParallelVariantWindowProcessor {
                 let mut w = bgzf::io::multithreaded_writer::Builder::default()
                     .set_worker_count(NonZeroUsize::new(worker_threads).unwrap())
                     .build_from_writer(file);
-                {
-                    let mut writer = vcf::io::Writer::new(&mut w);
-                    writer
-                        .write_header(&output_header)
-                        .context("failed to write VCF header")?;
-                }
+                w.write_all(&header_text).context("failed to write VCF header")?;
                 Some(w)
             }
             None => None,
         };
         let serialize = mt_writer.is_some();
 
-        // 5. Set up channels.
-        let (work_tx, work_rx) = bounded::<Window>(worker_threads * 4);
-        type Out = (usize, u64, Result<Vec<u8>>);
-        let (out_tx, out_rx) = bounded::<Out>(worker_threads * 4);
+        // 3. Channels. Every window in flight holds a permit, so the channels
+        //    never need more capacity than `max_in_flight`.
+        let (work_tx, work_rx) = bounded::<Window>(max_in_flight);
+        type Out = (usize, usize, u64, Result<Vec<u8>>);
+        let (out_tx, out_rx) = bounded::<Out>(max_in_flight);
+        let (permit_tx, permit_rx) = bounded::<()>(max_in_flight);
+        for _ in 0..max_in_flight {
+            permit_tx.send(()).expect("permit channel has capacity");
+        }
 
-        // 6. Run the producer + workers + writer in a scope.
+        // 4. Producer + workers + writer.
         std::thread::scope(|scope| -> Result<()> {
-            // Move out_rx into the scope so it's dropped when the writer
-            // finishes (or errors), unblocking workers' sends.
+            // Move out_rx and permit_tx into the scope so they're dropped when
+            // the writer finishes (or errors), unblocking workers' sends and
+            // the producer's permit wait.
             let out_rx = out_rx;
+            let permit_tx = permit_tx;
 
-            // Producer: enumerate windows.
-            let work_tx_producer = work_tx.clone();
-            let windows_for_producer = windows.clone();
+            // Producer: generate windows lazily, in order, one permit each.
+            // Because dispatch is in order, the next window the writer needs
+            // is always already in flight, so this cannot deadlock.
+            let producer_input = input.clone();
             scope.spawn(move || {
-                for w in windows_for_producer {
-                    if work_tx_producer.send(w).is_err() {
+                // Own reader for index lookups (only used to skip empty spans;
+                // if it cannot be opened, every window is simply queried).
+                let reader = VcfReader::open_indexed(&producer_input).ok();
+                let mut next_idx = 0usize;
+                let mut emit = |mut w: Window| -> bool {
+                    if permit_rx.recv().is_err() {
+                        return false;
+                    }
+                    w.idx = next_idx;
+                    next_idx += 1;
+                    work_tx.send(w).is_ok()
+                };
+                for contig in &contigs {
+                    let wgen = WindowGen {
+                        contig,
+                        window_size,
+                        stride,
+                        tid: reader.as_ref().map(|r| r.tid(&contig.name)),
+                        reader: reader.as_ref(),
+                    };
+                    if !wgen.run(&mut emit) {
                         break;
                     }
                 }
             });
-            drop(work_tx);
 
             // Workers.
             for _ in 0..worker_threads {
                 let work_rx = work_rx.clone();
                 let out_tx = out_tx.clone();
                 let input = input.clone();
-                let input_header = Arc::clone(&input_header);
-                let output_header = Arc::clone(&output_header);
-                let record_callback = Arc::clone(&record_callback);
-        scope.spawn(move || {
-            let mut reader = match variant::io::indexed_reader::Builder::default()
-                .build_from_path(&input)
-            {
-            Ok(r) => r,
-            Err(e) => {
-                    // Send the error tagged to whatever window we were going to handle.
-                    // Drain in the meantime so the producer doesn't block.
-                    while let Ok(w) = work_rx.recv() {
-                        let _ = out_tx.send((
-                            w.idx,
-                            w.bp(),
-                            Err(anyhow!(
-                                "worker failed to open indexed reader for {}: {e}",
-                                input.display()
-                            )),
-                        ));
+                let header_lines = header_lines.clone();
+                let samples = samples.clone();
+                let record_factory = Arc::clone(&record_factory);
+                scope.spawn(move || {
+                    let setup = || -> Result<(VcfReader, RecordFn)> {
+                        let mut reader = VcfReader::open_indexed(&input)?;
+                        if let Some(s) = samples.as_ref() {
+                            reader.subset_samples(s)?;
+                        }
+                        reader.append_header_lines(&header_lines)?;
+                        let f = record_factory(reader.header())?;
+                        Ok((reader, f))
+                    };
+                    let (mut reader, mut f) = match setup() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            // Report the error for every window we receive so
+                            // the producer is not blocked.
+                            let msg = format!("{e:#}");
+                            while let Ok(w) = work_rx.recv() {
+                                let _ = out_tx.send((w.idx, w.n_windows, w.bp, Err(anyhow!("{msg}"))));
+                            }
+                            return;
+                        }
+                    };
+                    // Two record buffers used alternately: bcftools' filter.c
+                    // caches per-record data keyed by the record's address,
+                    // which must therefore differ between consecutive records.
+                    let mut recs = [reader.empty_record(), reader.empty_record()];
+                    let mut ks = KString::new();
+                    while let Ok(window) = work_rx.recv() {
+                        let result = if window.skip {
+                            Ok(Vec::new())
+                        } else {
+                            process_window(&mut reader, &mut recs, &mut ks, serialize, &window, &mut f)
+                        };
+                        if out_tx.send((window.idx, window.n_windows, window.bp, result)).is_err() {
+                            break;
+                        }
                     }
-                    return;
-                }
-            };
-
-            while let Ok(window) = work_rx.recv() {
-                let bp = window.bp();
-                let result = process_window(
-                    &mut reader,
-                    &input_header,
-                    if serialize { Some(output_header.as_ref()) } else { None },
-                    &window,
-                    record_callback.as_ref(),
-                );
-                if out_tx.send((window.idx, bp, result)).is_err() {
-                    break;
-                }
-            }
-        });
+                });
             }
             drop(out_tx);
 
             // Writer / re-orderer / progress (main scope thread).
-            let mut buffer: BTreeMap<usize, (u64, Vec<u8>)> = BTreeMap::new();
+            let mut buffer: BTreeMap<usize, (usize, u64, Vec<u8>)> = BTreeMap::new();
             let mut next_idx = 0usize;
+            let mut done_windows = 0usize;
             let mut cum_bp: u64 = 0;
-            let mut window_errors: Vec<(usize, anyhow::Error)> = Vec::new();
-            let total_windows = windows.len();
-            while let Ok((idx, bp, result)) = out_rx.recv() {
+            let mut first_error: Option<anyhow::Error> = None;
+            while let Ok((idx, n, bp, result)) = out_rx.recv() {
                 match result {
                     Ok(bytes) => {
-                        buffer.insert(idx, (bp, bytes));
+                        buffer.insert(idx, (n, bp, bytes));
                     }
                     Err(e) => {
-                        window_errors.push((idx, e));
-                        buffer.insert(idx, (bp, Vec::new()));
+                        // Fail the run: never silently drop data.
+                        first_error = Some(e);
+                        break;
                     }
                 }
-                while let Some((bp, bytes)) = buffer.remove(&next_idx) {
+                while let Some((n, bp, bytes)) = buffer.remove(&next_idx) {
                     if let Some(w) = mt_writer.as_mut() {
-                        w.write_all(&bytes)
-                            .context("failed to write window bytes")?;
+                        w.write_all(&bytes).context("failed to write window bytes")?;
                     }
                     cum_bp += bp;
-                    if let Some(cb) = progress_callback.as_ref() {
-                        cb(cum_bp, next_idx + 1, total_windows);
+                    done_windows += n;
+                    // Items beyond the declared contig length (n == 0) carry
+                    // no progress.
+                    if n > 0
+                        && let Some(cb) = progress_callback.as_ref()
+                    {
+                        cb(cum_bp, done_windows, total_windows);
                     }
                     next_idx += 1;
+                    // Window written: release its permit.
+                    let _ = permit_tx.send(());
                 }
             }
 
-            if !window_errors.is_empty() {
-                for (idx, e) in &window_errors {
-                    eprintln!("varanrs: window {idx} failed: {e}");
-                }
-                return Err(anyhow!(
-                    "{} of {} windows failed (first: window {}: {})",
-                    window_errors.len(),
-                    windows.len(),
-                    window_errors[0].0,
-                    window_errors[0].1,
-                ));
+            if let Some(e) = first_error {
+                return Err(e);
             }
-
-            if next_idx != windows.len() {
+            if done_windows != total_windows {
                 return Err(anyhow!(
-                    "writer terminated with gaps: wrote {next_idx} of {} windows",
-                    windows.len()
+                    "writer terminated with gaps: wrote {done_windows} of {total_windows} windows"
                 ));
             }
             Ok(())
@@ -468,208 +450,220 @@ impl ParallelVariantWindowProcessor {
     }
 }
 
-fn enumerate_windows(
-    header: &vcf::Header,
+/// Decide which contigs to process, in file order, with declared lengths.
+fn plan_contigs(
+    reader: &VcfReader,
     window_size: u64,
-    stride: usize,
-    indexed_contigs: Option<&HashSet<Vec<u8>>>,
     contig_filter: Option<&HashSet<String>>,
     contig_lengths: Option<&IndexMap<String, u64>>,
-) -> Vec<Window> {
-    let mut out = Vec::new();
-    let mut abs_idx = 0usize;
-
-    let header_contig_names: HashSet<&str> =
-        header.contigs().iter().map(|(n, _)| n.as_str()).collect();
-
-    // Build ordered list of (name, length). Header contigs come first in header
-    // order; then contigs from contig_lengths not in the header, in their
-    // insertion order.
+) -> Vec<ContigPlan> {
+    // Candidates: header contigs, then .fai contigs, then (tabix) contigs that
+    // only the index knows about — so records on contigs missing from the
+    // header are not lost.
     let mut ordered: Vec<(String, u64)> = Vec::new();
-    for (contig, map) in header.contigs().iter() {
-        let length = map
-            .length()
-            .or_else(|| {
-                contig_lengths
-                    .and_then(|cl| cl.get(contig.as_str()).copied())
-                    .and_then(|l| usize::try_from(l).ok())
-            });
-        if let Some(len) = length {
-            ordered.push((contig.to_string(), len as u64));
-        } else {
-            eprintln!("varanrs: contig {contig} has no length in header or fai; skipping");
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |name: String, len: Option<u64>, ordered: &mut Vec<(String, u64)>| {
+        if seen.insert(name.clone()) {
+            let len = len.or_else(|| contig_lengths.and_then(|cl| cl.get(&name).copied()));
+            ordered.push((name, len.unwrap_or(0)));
         }
+    };
+    for (name, len) in hts::header_contigs(reader.header()) {
+        push(name, len, &mut ordered);
     }
     if let Some(cl) = contig_lengths {
         for (name, len) in cl {
-            if !header_contig_names.contains(name.as_str()) {
-                ordered.push((name.clone(), *len));
-            }
+            push(name.clone(), Some(*len), &mut ordered);
+        }
+    }
+    if let Some(names) = reader.tabix_seqnames() {
+        for name in names {
+            push(name, None, &mut ordered);
         }
     }
 
-    for (contig, length) in &ordered {
+    // Keep requested contigs that the index has data for (others have no
+    // records), ordered by the file offset of their first data.
+    let mut keyed: Vec<(u64, usize, String, u64)> = Vec::new();
+    for (i, (name, len)) in ordered.into_iter().enumerate() {
         if let Some(filter) = contig_filter
-            && !filter.contains(contig.as_str())
+            && !filter.contains(name.as_str())
         {
             continue;
         }
-        if let Some(set) = indexed_contigs
-            && !set.contains(contig.as_bytes())
-        {
-            continue;
-        }
-        let length = *length;
-        let mut start = 1u64;
-        while start <= length {
-            let end = (start + window_size - 1).min(length);
-            if abs_idx.is_multiple_of(stride) {
-                out.push(Window {
-                    idx: out.len(),
-                    contig: Box::from(contig.as_str()),
-                    start,
-                    end,
-                });
-            }
-            abs_idx += 1;
-            start = end + 1;
-        }
+        let Some(tid) = reader.tid(&name) else { continue };
+        let Some(itr) = reader.query(tid, 0, MAX_POS as i64) else { continue };
+        let Some(off) = itr.min_offset() else { continue };
+        keyed.push((off, i, name, len));
+    }
+    keyed.sort_by_key(|k| (k.0, k.1));
+
+    let mut out = Vec::new();
+    let mut abs = 0usize;
+    for (_, _, name, length) in keyed {
+        let plan = ContigPlan { name: Arc::from(name.as_str()), length, first_abs: abs };
+        abs += plan.n_windows(window_size);
+        out.push(plan);
     }
     out
 }
 
-fn process_window<R>(
-    reader: &mut variant::io::IndexedReader<R>,
-    input_header: &vcf::Header,
-    output_header: Option<&vcf::Header>,
-    window: &Window,
-    record_callback: &RecordCallback,
-) -> Result<Vec<u8>>
-where
-    R: bgzf::io::BufRead + bgzf::io::Seek,
-{
-    let start = Position::try_from(window.start as usize).context("invalid window start")?;
-    let end = Position::try_from(window.end as usize).context("invalid window end")?;
-    let region = Region::new(window.contig.as_ref(), start..=end);
-
-    let query = reader
-        .query(input_header, &region)
-        .with_context(|| format!("query failed for {}:{}-{}", window.contig, window.start, window.end))?;
-
-    let mut bytes = Vec::new();
-    let mut skipped = 0usize;
-    match output_header {
-        Some(out_header) => {
-            let mut writer = vcf::io::Writer::new(&mut bytes);
-            for result in query {
-                let record = match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        skipped += 1;
-                        eprintln!(
-                            "varanrs: window {} {}:{}-{}: error reading record: {e}",
-                            window.idx, window.contig, window.start, window.end
-                        );
-                        continue;
-                    }
-                };
-                let _pos = match take_pos_if_in_window(record.as_ref(), window) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        skipped += 1;
-                        eprintln!(
-                            "varanrs: window {} {}:{}-{}: skipping record ({e})",
-                            window.idx, window.contig, window.start, window.end
-                        );
-                        continue;
-                    }
-                };
-                let buf = match RecordBuf::try_from_variant_record(input_header, record.as_ref()) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        skipped += 1;
-                        if skipped <= 5 {
-                            eprintln!(
-                                "varanrs: window {} {}:{}-{}: skipping record (RecordBuf conversion failed: {e})",
-                                window.idx, window.contig, window.start, window.end
-                            );
-                        }
-                        continue;
-                    }
-                };
-                if let Some(out) = record_callback(buf) {
-                    writer
-                        .write_variant_record(out_header, &out)
-                        .context("failed to serialize record")?;
-                }
-            }
-        }
-        None => {
-            for result in query {
-                let record = match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        skipped += 1;
-                        eprintln!(
-                            "varanrs: window {} {}:{}-{}: error reading record: {e}",
-                            window.idx, window.contig, window.start, window.end
-                        );
-                        continue;
-                    }
-                };
-                let _pos = match take_pos_if_in_window(record.as_ref(), window) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        skipped += 1;
-                        eprintln!(
-                            "varanrs: window {} {}:{}-{}: skipping record ({e})",
-                            window.idx, window.contig, window.start, window.end
-                        );
-                        continue;
-                    }
-                };
-                let buf = match RecordBuf::try_from_variant_record(input_header, record.as_ref()) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        skipped += 1;
-                        if skipped <= 5 {
-                            eprintln!(
-                                "varanrs: window {} {}:{}-{}: skipping record (RecordBuf conversion failed: {e})",
-                                window.idx, window.contig, window.start, window.end
-                            );
-                        }
-                        continue;
-                    }
-                };
-                let _ = record_callback(buf);
-            }
-        }
-    }
-    if skipped > 5 {
-        eprintln!(
-            "varanrs: window {} {}:{}-{}: {} further records skipped",
-            window.idx, window.contig, window.start, window.end,
-            skipped - 5
-        );
-    }
-    Ok(bytes)
+/// Lazily generates the windows of one contig, in order. Windows beyond the
+/// declared contig length (a "tail" up to the largest VCF position) are also
+/// covered, so records past a wrong or missing header length are never
+/// silently lost. Spans the index shows to be empty are emitted as single
+/// cheap skip items instead of one item per window, so a contig declared as
+/// 2^31 bp with data in the first kb costs a handful of index lookups rather
+/// than millions of queries.
+struct WindowGen<'a> {
+    contig: &'a ContigPlan,
+    window_size: u64,
+    stride: usize,
+    reader: Option<&'a VcfReader>,
+    /// `None`: no index reader; `Some(None)`: the index has no such contig.
+    tid: Option<Option<i32>>,
 }
 
-/// Boundary dedup: tabix queries return any record whose span overlaps the
-/// region, so a record starting *before* this window will also be returned by
-/// the previous window. Keep it only in the window where its POS lands.
-fn take_pos_if_in_window(
-    record: &dyn vcf::variant::Record,
-    window: &Window,
-) -> Result<Option<Position>> {
-    let pos = match record.variant_start() {
-        Some(r) => r.context("missing POS")?,
-        None => return Ok(None), // unplaced record; skip.
-    };
-    if (pos.get() as u64) < window.start {
-        return Ok(None);
+impl WindowGen<'_> {
+    const FANOUT: usize = 8;
+
+    /// Windows within the declared length.
+    fn n_declared(&self) -> usize {
+        self.contig.n_windows(self.window_size)
     }
-    Ok(Some(pos))
+
+    /// All windows to visit: declared ones plus, when every window is
+    /// processed (stride 1), the tail up to the largest VCF position.
+    fn n_total(&self) -> usize {
+        let d = self.n_declared();
+        if self.stride == 1 && self.reader.is_some() {
+            d.max(MAX_POS.div_ceil(self.window_size) as usize)
+        } else {
+            d
+        }
+    }
+
+    /// Number of stride-selected declared windows among windows `[k0, k1)`.
+    fn n_selected(&self, k0: usize, k1: usize) -> usize {
+        let d = self.n_declared();
+        let (k0, k1) = (k0.min(d), k1.min(d));
+        let a0 = self.contig.first_abs + k0;
+        let a1 = self.contig.first_abs + k1;
+        a1.div_ceil(self.stride) - a0.div_ceil(self.stride)
+    }
+
+    fn window_bp(&self, k: usize) -> u64 {
+        let start = k as u64 * self.window_size + 1;
+        let end = ((k as u64 + 1) * self.window_size).min(self.contig.length);
+        end - start + 1
+    }
+
+    /// Base pairs of the stride-selected declared windows in `[k0, k1)`.
+    fn selected_bp(&self, k0: usize, k1: usize) -> u64 {
+        let n = self.n_selected(k0, k1) as u64;
+        if n == 0 {
+            return 0;
+        }
+        let mut bp = n * self.window_size;
+        let last = self.n_declared() - 1;
+        if k0 <= last && last < k1 && (self.contig.first_abs + last).is_multiple_of(self.stride) {
+            bp -= self.window_size - self.window_bp(last);
+        }
+        bp
+    }
+
+    /// Whether the index proves that no record overlaps `[start, end]`
+    /// (1-based, inclusive).
+    fn provably_empty(&self, start: u64, end: u64) -> bool {
+        let Some(reader) = self.reader else { return false };
+        match self.tid {
+            Some(None) => true, // contig absent from the index: no records
+            Some(Some(tid)) => match reader.query(tid, start as i64 - 1, end as i64) {
+                Some(itr) => itr.is_empty(),
+                None => false, // be conservative: query the windows
+            },
+            None => false,
+        }
+    }
+
+    /// Emit all items for the contig; returns false if the consumer hung up.
+    fn run(&self, emit: &mut impl FnMut(Window) -> bool) -> bool {
+        self.span(0, self.n_total(), emit)
+    }
+
+    fn span(&self, k0: usize, k1: usize, emit: &mut impl FnMut(Window) -> bool) -> bool {
+        let n_sel = self.n_selected(k0, k1);
+        let n_tail = k1.saturating_sub(k0.max(self.n_declared()));
+        if n_sel == 0 && n_tail == 0 {
+            return true;
+        }
+        let start = k0 as u64 * self.window_size + 1;
+        // Query the full nominal span even past the declared length (that only
+        // affects progress accounting): a wrong header length must not hide
+        // records.
+        let end = (k1 as u64 * self.window_size).min(MAX_POS);
+        let item = |skip: bool| Window {
+            idx: 0,
+            contig: Arc::clone(&self.contig.name),
+            start,
+            end,
+            n_windows: n_sel,
+            bp: self.selected_bp(k0, k1),
+            skip,
+        };
+        if start > MAX_POS || self.provably_empty(start, end) {
+            return emit(item(true));
+        }
+        if k1 - k0 == 1 {
+            return emit(item(false));
+        }
+        let step = (k1 - k0).div_ceil(Self::FANOUT);
+        let mut k = k0;
+        while k < k1 {
+            let next = (k + step).min(k1);
+            if !self.span(k, next, emit) {
+                return false;
+            }
+            k = next;
+        }
+        true
+    }
+}
+
+fn process_window(
+    reader: &mut VcfReader,
+    recs: &mut [Record; 2],
+    ks: &mut KString,
+    serialize: bool,
+    window: &Window,
+    f: &mut RecordFn,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let Some(tid) = reader.tid(&window.contig) else {
+        return Ok(bytes);
+    };
+    let mut itr = reader
+        .query(tid, window.start as i64 - 1, window.end as i64)
+        .ok_or_else(|| anyhow!("index query failed for {}:{}-{}", window.contig, window.start, window.end))?;
+    let mut cur = 0usize;
+    loop {
+        cur ^= 1;
+        let rec = &mut recs[cur];
+        if !reader
+            .itr_next(&mut itr, rec)
+            .with_context(|| format!("in {}:{}-{}", window.contig, window.start, window.end))?
+        {
+            break;
+        }
+        // Boundary dedup: index queries return every record overlapping the
+        // region, so a record starting before this window was already
+        // handled by the window holding its POS.
+        if (rec.pos() as u64) + 1 < window.start {
+            continue;
+        }
+        if f(rec).with_context(|| format!("at {}", hts::rec_locus(rec)))? && serialize {
+            hts::format_record(rec, ks, &mut bytes)?;
+        }
+    }
+    Ok(bytes)
 }

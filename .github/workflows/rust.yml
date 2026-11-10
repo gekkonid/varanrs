@@ -67,10 +67,13 @@ jobs:
         key: linux-aarch64-${{ matrix.rust }}
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev tabix bcftools
+      run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev tabix bcftools libclang-dev
 
     - name: Build
       run: cargo build --verbose --release
+
+    - name: Check binary links only the C runtime
+      run: .github/scripts/check-linkage.sh target/release/varanrs
 
     - name: Set missing bcftools env
       run: |
@@ -118,6 +121,9 @@ jobs:
 
     - name: Build (arm64)
       run: cargo build --verbose --release --target aarch64-apple-darwin
+
+    - name: Check binary links only the C runtime
+      run: .github/scripts/check-linkage.sh target/aarch64-apple-darwin/release/varanrs
 
     #- name: Build (x86_64)
     #  run: cargo build --verbose --release --target x86_64-apple-darwin

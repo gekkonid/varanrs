@@ -1,31 +1,17 @@
 //! Per-record utility callbacks suitable for `ParallelVariantWindowProcessor`.
 
-use noodles_vcf as vcf;
-use vcf::variant::RecordBuf;
+use rust_htslib::bcf::Record;
 
 /// Force REF and ALT alleles to ASCII-uppercase. Workaround for GLnexus, which
-/// occasionally emits lowercase allele characters that downstream tools reject.
-pub fn uppercase_alleles(mut buf: RecordBuf) -> Option<RecordBuf> {
-    buf.reference_bases_mut().make_ascii_uppercase();
-    for alt in buf.alternate_bases_mut().as_mut().iter_mut() {
-        alt.make_ascii_uppercase();
+/// occasionally emits lowercase allele characters that downstream tools
+/// reject. Always keeps the record.
+pub fn uppercase_alleles(rec: &mut Record) -> bool {
+    let alleles: Vec<Vec<u8>> = rec.alleles().iter().map(|a| a.to_ascii_uppercase()).collect();
+    if alleles.iter().zip(rec.alleles()).any(|(u, a)| u.as_slice() != a) {
+        let refs: Vec<&[u8]> = alleles.iter().map(Vec::as_slice).collect();
+        rec.set_alleles(&refs).expect("setting alleles of an unpacked record");
     }
-    Some(buf)
-}
-
-/// Work around a GLnexus header bug: it declares `RNC` as `Type=Character,
-/// Number=2` but actually encodes it as a single string like `"II"`.  Patching
-/// the header to `Type=String, Number=1` lets noodles parse the records.
-pub fn normalize_header_for_noodles(header: &mut vcf::Header) {
-    use vcf::header::record::value::{Map, map::Format};
-    use vcf::header::record::value::map::format::{Number, Type};
-
-    if header.formats().contains_key("RNC") {
-        header.formats_mut().insert(
-            String::from("RNC"),
-            Map::<Format>::new(Number::Count(1), Type::String, "Reason for No Call"),
-        );
-    }
+    true
 }
 
 pub fn human_bp(bp: u64) -> (f64, &'static str) {
@@ -46,65 +32,53 @@ pub fn human_bp(bp: u64) -> (f64, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noodles_core::Position;
+    use crate::hts::VcfReader;
 
-    fn record(reference: &str, alts: &[&str]) -> RecordBuf {
-        let mut buf = RecordBuf::default();
-        *buf.reference_sequence_name_mut() = String::from("chr1");
-        *buf.variant_start_mut() = Some(Position::try_from(100).unwrap());
-        *buf.reference_bases_mut() = reference.to_string();
-        *buf.alternate_bases_mut().as_mut() = alts.iter().map(|a| a.to_string()).collect();
-        buf
+    /// Parse one VCF record line (single sample-less site) via htslib.
+    fn record(reference: &str, alts: &[&str]) -> (VcfReader, Record) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.vcf");
+        let alt = if alts.is_empty() { ".".to_string() } else { alts.join(",") };
+        std::fs::write(
+            &path,
+            format!("##fileformat=VCFv4.2\n##contig=<ID=chr1>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\nchr1\t100\t.\t{reference}\t{alt}\t.\t.\t.\n"),
+        )
+        .unwrap();
+        let mut r = VcfReader::open(path.to_str().unwrap()).unwrap();
+        let mut rec = r.empty_record();
+        assert!(r.read(&mut rec).unwrap());
+        (r, rec)
+    }
+
+    fn alleles(rec: &Record) -> Vec<String> {
+        rec.alleles().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect()
     }
 
     #[test]
     fn uppercases_lowercase_ref_and_alt() {
-        let buf = uppercase_alleles(record("a", &["t"])).unwrap();
-        assert_eq!(buf.reference_bases(), "A");
-        assert_eq!(buf.alternate_bases().as_ref(), &["T".to_string()]);
+        let (_r, mut rec) = record("a", &["t"]);
+        assert!(uppercase_alleles(&mut rec));
+        assert_eq!(alleles(&rec), vec!["A", "T"]);
     }
 
     #[test]
     fn leaves_already_uppercase_unchanged() {
-        let buf = uppercase_alleles(record("ACGT", &["G", "TT"])).unwrap();
-        assert_eq!(buf.reference_bases(), "ACGT");
-        assert_eq!(
-            buf.alternate_bases().as_ref(),
-            &["G".to_string(), "TT".to_string()]
-        );
+        let (_r, mut rec) = record("ACGT", &["G", "TT"]);
+        uppercase_alleles(&mut rec);
+        assert_eq!(alleles(&rec), vec!["ACGT", "G", "TT"]);
     }
 
     #[test]
     fn handles_multi_alt() {
-        let buf = uppercase_alleles(record("a", &["c", "g", "t"])).unwrap();
-        assert_eq!(buf.reference_bases(), "A");
-        assert_eq!(
-            buf.alternate_bases().as_ref(),
-            &["C".to_string(), "G".to_string(), "T".to_string()]
-        );
+        let (_r, mut rec) = record("a", &["c", "g", "t"]);
+        uppercase_alleles(&mut rec);
+        assert_eq!(alleles(&rec), vec!["A", "C", "G", "T"]);
     }
 
     #[test]
     fn uppercases_iupac_ambiguity_code() {
-        let buf = uppercase_alleles(record("n", &["a"])).unwrap();
-        assert_eq!(buf.reference_bases(), "N");
-        assert_eq!(buf.alternate_bases().as_ref(), &["A".to_string()]);
-    }
-
-    #[test]
-    fn normalize_header_fixes_rnc_type() {
-        let mut header = vcf::Header::default();
-        use vcf::header::record::value::{Map, map::Format};
-        use vcf::header::record::value::map::format::{Number, Type};
-        header.formats_mut().insert(
-            String::from("RNC"),
-            Map::<Format>::new(Number::Count(2), Type::Character, "Reason for No Call"),
-        );
-
-        normalize_header_for_noodles(&mut header);
-
-        let rnc = header.formats().get("RNC").unwrap();
-        assert_eq!(rnc.number(), Number::Count(1));
-        assert_eq!(rnc.ty(), Type::String);
+        let (_r, mut rec) = record("n", &["a"]);
+        uppercase_alleles(&mut rec);
+        assert_eq!(alleles(&rec), vec!["N", "A"]);
     }
 }

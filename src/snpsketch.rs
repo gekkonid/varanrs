@@ -5,53 +5,36 @@ use bitvec::order::Lsb0;
 use bitvec::vec::BitVec;
 use histr::StreamHist;
 use indexmap::IndexMap;
-use noodles_vcf as vcf;
-use vcf::header::record::value::map::info::Number as InfoNumber;
-use vcf::variant::record_buf::info::field::Value as InfoValue;
-use vcf::variant::record_buf::info::field::value::Array as InfoArray;
-use vcf::variant::RecordBuf;
-use vcf::variant::record_buf::samples::sample::Value as SampleValue;
+use rust_htslib::bcf::Record;
+
+use crate::hts::{self, HeaderView};
 
 struct InfoHistogram {
     name: String,
-    number: InfoNumber,
+    /// Value index used for multi-valued tags (Number=R: first ALT).
+    target_idx: usize,
+    is_float: bool,
     hist: StreamHist,
 }
 
-fn insert_info_value(val: &InfoValue, hist: &mut StreamHist, target_idx: usize) {
-    match val {
-        InfoValue::Integer(n) => {
-            let v = *n as f64;
-            if v.is_finite() {
-                hist.insert(v);
-            }
+impl InfoHistogram {
+    fn insert(&mut self, rec: &Record) {
+        let v = if self.is_float {
+            hts::info_f32(rec, &self.name).ok().and_then(|v| {
+                let x = *v.get(self.target_idx)?;
+                (!hts::is_float_missing(x) && !hts::is_float_vector_end(x)).then_some(x as f64)
+            })
+        } else {
+            hts::info_i32(rec, &self.name).ok().and_then(|v| {
+                let x = *v.get(self.target_idx)?;
+                (x != hts::INT32_MISSING && x != hts::INT32_VECTOR_END).then_some(x as f64)
+            })
+        };
+        if let Some(v) = v
+            && v.is_finite()
+        {
+            self.hist.insert(v);
         }
-        InfoValue::Float(f) => {
-            let v = *f as f64;
-            if v.is_finite() {
-                hist.insert(v);
-            }
-        }
-        InfoValue::Array(arr) => match arr {
-            InfoArray::Integer(v) => {
-                if let Some(Some(n)) = v.get(target_idx) {
-                    let v = *n as f64;
-                    if v.is_finite() {
-                        hist.insert(v);
-                    }
-                }
-            }
-            InfoArray::Float(v) => {
-                if let Some(Some(f)) = v.get(target_idx) {
-                    let v = *f as f64;
-                    if v.is_finite() {
-                        hist.insert(v);
-                    }
-                }
-            }
-            _ => {}
-        },
-        _ => {}
     }
 }
 
@@ -105,49 +88,35 @@ impl SketchAccumulator {
         self.calls[s_idx].count_ones() as u64
     }
 
-    pub fn process_record(&mut self, buf: &RecordBuf) {
+    pub fn process_record(&mut self, rec: &Record) {
         let contig_rank = self
             .contig_rank
-            .get(buf.reference_sequence_name())
+            .get(&hts::rec_contig(rec))
             .copied()
             .unwrap_or(u32::MAX as usize);
-        let pos = buf
-            .variant_start()
-            .map(|p| p.get() as u32)
-            .unwrap_or(0);
-
-        let samples = buf.samples();
-        let keys = samples.keys().as_ref();
-        let gt_idx = keys.get_index_of("GT");
-        let dp_idx = keys.get_index_of("DP");
+        let pos = (rec.pos() + 1) as u32;
         let n_samples = self.calls.len();
 
-        let mut processed = 0usize;
+        let gt = hts::format_i32(rec, "GT").ok().filter(|v| !v.is_empty());
+        let dp = hts::format_i32(rec, "DP").ok().filter(|v| !v.is_empty());
+        let gt_width = gt.as_ref().map_or(0, |v| v.len() / n_samples.max(1));
+        let dp_width = dp.as_ref().map_or(0, |v| v.len() / n_samples.max(1));
 
-        for (s_idx, sample) in samples.values().enumerate() {
-            if s_idx >= n_samples {
-                break;
-            }
-            processed = s_idx + 1;
-
+        for s_idx in 0..n_samples {
             let mut has_missing = true;
             let mut n_alt: u8 = 0;
             let mut ploidy: u8 = 0;
-
-            if let Some(idx) = gt_idx
-                && let Some(SampleValue::Genotype(g)) =
-                    sample.values().get(idx).and_then(|v| v.as_ref())
-            {
-                let alleles = g.as_ref();
-                ploidy = alleles.len() as u8;
-                if ploidy > 0 {
-                    has_missing = false;
-                    for allele in alleles {
-                        match allele.position() {
-                            Some(0) => {}
-                            Some(_) => n_alt += 1,
-                            None => has_missing = true,
-                        }
+            if let Some(gt) = gt.as_ref() {
+                let alleles = gt[s_idx * gt_width..(s_idx + 1) * gt_width]
+                    .iter()
+                    .take_while(|&&v| v != hts::INT32_VECTOR_END);
+                has_missing = false;
+                for &v in alleles {
+                    ploidy += 1;
+                    if hts::gt_is_missing(v) {
+                        has_missing = true;
+                    } else if hts::gt_allele(v) != 0 {
+                        n_alt += 1;
                     }
                 }
             }
@@ -162,51 +131,40 @@ impl SketchAccumulator {
                 self.hom_alt[s_idx].push(n_alt == ploidy);
             }
 
-            if let Some(idx) = dp_idx
-                && let Some(SampleValue::Integer(dp)) =
-                    sample.values().get(idx).and_then(|v| v.as_ref())
+            // Number=1 DP only (one value per sample)
+            if let Some(dp) = dp.as_ref()
+                && dp_width == 1
             {
-                self.dp_sums[s_idx] += *dp as u64;
-                self.dp_counts[s_idx] += 1;
+                let v = dp[s_idx];
+                if v != hts::INT32_MISSING && v != hts::INT32_VECTOR_END {
+                    self.dp_sums[s_idx] += v as u64;
+                    self.dp_counts[s_idx] += 1;
+                }
             }
-        }
-
-        for s_idx in processed..n_samples {
-            self.calls[s_idx].push(false);
-            self.any_alt[s_idx].push(false);
-            self.hom_alt[s_idx].push(false);
         }
 
         self.positions.push((contig_rank as u32, pos));
         self.n_sites += 1;
 
-        let info = buf.info();
         for entry in &mut self.info_histograms {
-            let target_idx = match entry.number {
-                InfoNumber::ReferenceAlternateBases => 1usize,
-                _ => 0usize,
-            };
-            if let Some(Some(val)) = info.get(&entry.name) {
-                insert_info_value(val, &mut entry.hist, target_idx);
-            }
+            entry.insert(rec);
         }
     }
 
-    pub fn init_info_histograms(&mut self, header: &vcf::Header, bin_count: usize) {
-        for (name, map) in header.infos() {
-            let number = map.number();
-            if matches!(number, InfoNumber::Samples) {
+    pub fn init_info_histograms(&mut self, header: &HeaderView, bin_count: usize) {
+        for (name, number, ty) in hts::header_infos(header) {
+            if number == "G" {
                 continue;
             }
-            let ty = map.ty();
-            if !matches!(ty, vcf::header::record::value::map::info::Type::Integer
-                | vcf::header::record::value::map::info::Type::Float)
-            {
-                continue;
-            }
+            let is_float = match ty.as_str() {
+                "Integer" => false,
+                "Float" => true,
+                _ => continue,
+            };
             self.info_histograms.push(InfoHistogram {
-                name: name.clone(),
-                number,
+                name,
+                target_idx: if number == "R" { 1 } else { 0 },
+                is_float,
                 hist: StreamHist::with_capacity(bin_count),
             });
         }

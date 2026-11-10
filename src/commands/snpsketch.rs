@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use indexmap::IndexMap;
-use noodles_util::variant;
 
 use crate::args::{self, IndexedInput};
+use crate::hts::{self, VcfReader};
 use crate::processor::ParallelVariantWindowProcessor;
 use crate::snpsketch::SketchAccumulator;
 use crate::util::human_bp;
@@ -44,15 +44,14 @@ pub fn run(args: SketchArgs) -> Result<()> {
     let input = args.indexed.input.as_ref()
         .ok_or_else(|| anyhow!("snpsketch requires an indexed input file"))?;
 
-    let mut reader = variant::io::indexed_reader::Builder::default()
-        .build_from_path(input)
-        .with_context(|| format!("failed to open indexed reader: {}", input.display()))?;
+    let reader = VcfReader::open_indexed(input)?;
+    let header = reader.header();
 
-    let header = reader
-        .read_header()
-        .context("failed to read header")?;
-
-    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
+    let sample_ids: Vec<String> = header
+        .samples()
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
 
     let (contig_rank, contig_lengths) = if let Some(ref fai_path) = args.indexed.fai {
         let fai = args::parse_fai(fai_path)?;
@@ -64,11 +63,10 @@ pub fn run(args: SketchArgs) -> Result<()> {
             .collect();
         (rank, Some(fai.lengths))
     } else {
-        let rank: IndexMap<String, usize> = header
-            .contigs()
-            .iter()
+        let rank: IndexMap<String, usize> = hts::header_contigs(header)
+            .into_iter()
             .enumerate()
-            .map(|(i, (name, _))| (name.to_string(), i))
+            .map(|(i, (name, _))| (name, i))
             .collect();
         (rank, None)
     };
@@ -96,7 +94,6 @@ pub fn run(args: SketchArgs) -> Result<()> {
         args.chunk,
     );
 
-    drop(reader);
 
     let threads = args.indexed.resolve_threads();
 
@@ -109,13 +106,13 @@ pub fn run(args: SketchArgs) -> Result<()> {
         accumulator
             .lock()
             .unwrap()
-            .init_info_histograms(&header, args.info_hist_bins);
+            .init_info_histograms(header, args.info_hist_bins);
     }
 
     let acc = Arc::clone(&accumulator);
-    let record_callback = move |buf| {
-        acc.lock().unwrap().process_record(&buf);
-        None
+    let record_callback = move |rec: &mut rust_htslib::bcf::Record| {
+        acc.lock().unwrap().process_record(rec);
+        false
     };
 
     let mut builder = ParallelVariantWindowProcessor::builder()

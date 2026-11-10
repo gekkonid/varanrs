@@ -5,8 +5,6 @@ use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Result;
-use noodles_util::variant;
-use noodles_vcf as vcf;
 
 mod common;
 
@@ -64,16 +62,11 @@ chr1\t500\t.\tA\tT\t.\t.\t.\tGT\t0/0
     };
     varanrs::commands::uppercase_alleles::run(args)?;
 
-    let mut reader = variant::io::reader::Builder::default().build_from_path(&output)?;
-    let header = reader.read_header()?;
+    let (_header, records) = varanrs::hts::read_all(output.to_str().unwrap())?;
     let mut count = 0;
-    for r in reader.records(&header) {
-        let r = r?;
-        let buf = vcf::variant::RecordBuf::try_from_variant_record(&header, r.as_ref())?;
-        let reference = buf.reference_bases();
-        assert_eq!(reference, &reference.to_ascii_uppercase(), "REF not upper");
-        for alt in buf.alternate_bases().as_ref() {
-            assert_eq!(alt, &alt.to_ascii_uppercase(), "ALT not upper");
+    for rec in &records {
+        for allele in rec.alleles() {
+            assert_eq!(allele, allele.to_ascii_uppercase().as_slice(), "allele not upper");
         }
         count += 1;
     }
