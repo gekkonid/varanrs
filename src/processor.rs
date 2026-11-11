@@ -551,18 +551,24 @@ impl WindowGen<'_> {
         self.contig.n_windows(self.window_size)
     }
 
-    /// All windows to visit: declared ones plus, when every window is
-    /// processed (stride 1), the tail up to the largest VCF position.
+    /// All windows to visit: declared ones plus the tail up to the largest
+    /// VCF position (beyond a wrong or missing declared length; empty tail
+    /// spans are skipped via the index).
     fn n_total(&self) -> usize {
         let d = self.n_declared();
-        if self.stride == 1 && self.reader.is_some() {
-            d.max(MAX_POS.div_ceil(self.window_size) as usize)
-        } else {
-            d
-        }
+        if self.reader.is_some() { d.max(MAX_POS.div_ceil(self.window_size) as usize) } else { d }
     }
 
-    /// Number of stride-selected declared windows among windows `[k0, k1)`.
+    /// Number of stride-selected windows among `[k0, k1)`, including tail
+    /// windows (selection continues the declared windows' stride pattern).
+    fn n_selected_all(&self, k0: usize, k1: usize) -> usize {
+        let a0 = self.contig.first_abs + k0;
+        let a1 = self.contig.first_abs + k1;
+        a1.div_ceil(self.stride) - a0.div_ceil(self.stride)
+    }
+
+    /// Number of stride-selected declared windows among windows `[k0, k1)`
+    /// (what progress is counted in).
     fn n_selected(&self, k0: usize, k1: usize) -> usize {
         let d = self.n_declared();
         let (k0, k1) = (k0.min(d), k1.min(d));
@@ -612,8 +618,7 @@ impl WindowGen<'_> {
 
     fn span(&self, k0: usize, k1: usize, emit: &mut impl FnMut(Window) -> bool) -> bool {
         let n_sel = self.n_selected(k0, k1);
-        let n_tail = k1.saturating_sub(k0.max(self.n_declared()));
-        if n_sel == 0 && n_tail == 0 {
+        if self.n_selected_all(k0, k1) == 0 {
             return true;
         }
         let start = k0 as u64 * self.window_size + 1;

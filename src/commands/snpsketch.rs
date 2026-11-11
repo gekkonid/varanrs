@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 
 use crate::args::{self, IndexedInput};
 use crate::hts::{self, VcfReader};
-use crate::processor::ParallelVariantWindowProcessor;
+use crate::processor::{ParallelVariantWindowProcessor, RecordFn};
 use crate::snpsketch::SketchAccumulator;
 use crate::util::human_bp;
 
@@ -97,22 +97,30 @@ pub fn run(args: SketchArgs) -> Result<()> {
 
     let threads = args.indexed.resolve_threads();
 
-    let accumulator = Arc::new(Mutex::new(SketchAccumulator::new(
-        sample_ids.clone(),
-        contig_rank,
-    )));
-
-    if args.info_stats.is_some() {
-        accumulator
-            .lock()
-            .unwrap()
-            .init_info_histograms(header, args.info_hist_bins);
-    }
-
-    let acc = Arc::clone(&accumulator);
-    let record_callback = move |rec: &mut rust_htslib::bcf::Record| {
-        acc.lock().unwrap().process_record(rec);
-        false
+    // One accumulator per worker (no lock contention); merged at the end.
+    let info_bins = args.info_stats.is_some().then_some(args.info_hist_bins);
+    let new_accumulator = {
+        let sample_ids = sample_ids.clone();
+        move |h: &rust_htslib::bcf::header::HeaderView| {
+            let mut a = SketchAccumulator::new(sample_ids.clone(), contig_rank.clone());
+            if let Some(bins) = info_bins {
+                a.init_info_histograms(h, bins);
+            }
+            a
+        }
+    };
+    let mut merged = new_accumulator(header);
+    let workers: Arc<Mutex<Vec<Arc<Mutex<SketchAccumulator>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let factory = {
+        let workers = Arc::clone(&workers);
+        move |h: &Arc<rust_htslib::bcf::header::HeaderView>| -> Result<RecordFn> {
+            let acc = Arc::new(Mutex::new(new_accumulator(h)));
+            workers.lock().unwrap().push(Arc::clone(&acc));
+            Ok(Box::new(move |rec: &mut rust_htslib::bcf::Record| {
+                acc.lock().unwrap().process_record(rec);
+                Ok(false)
+            }) as RecordFn)
+        }
     };
 
     let mut builder = ParallelVariantWindowProcessor::builder()
@@ -120,7 +128,7 @@ pub fn run(args: SketchArgs) -> Result<()> {
         .worker_threads(threads)
         .window_size(args.chunk)
         .stride(args.stride)
-        .record_callback(record_callback)
+        .record_factory(factory)
         .progress_callback(|cum_bp, done, total| {
             let pct = if total > 0 {
                 done as f64 / total as f64 * 100.0
@@ -147,7 +155,11 @@ pub fn run(args: SketchArgs) -> Result<()> {
     builder.run()?;
     eprintln!();
 
-    let acc = accumulator.lock().unwrap();
+    for w in workers.lock().unwrap().drain(..) {
+        let a = std::mem::replace(&mut *w.lock().unwrap(), SketchAccumulator::new(Vec::new(), IndexMap::new()));
+        merged.merge(a);
+    }
+    let acc = &merged;
 
     eprintln!(
         "  {} sites processed across {} samples",

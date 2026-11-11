@@ -68,6 +68,34 @@ impl SketchAccumulator {
         }
     }
 
+    /// Append another accumulator's sites (from the same samples, contig
+    /// ranks and histogram setup). Pairwise and per-sample statistics don't
+    /// depend on site order; genotype output is sorted by position.
+    pub fn merge(&mut self, other: SketchAccumulator) {
+        assert_eq!(self.calls.len(), other.calls.len(), "sample count mismatch");
+        self.n_sites += other.n_sites;
+        self.positions.extend(other.positions);
+        for (a, b) in self.calls.iter_mut().zip(other.calls) {
+            a.extend_from_bitslice(&b);
+        }
+        for (a, b) in self.any_alt.iter_mut().zip(other.any_alt) {
+            a.extend_from_bitslice(&b);
+        }
+        for (a, b) in self.hom_alt.iter_mut().zip(other.hom_alt) {
+            a.extend_from_bitslice(&b);
+        }
+        for (a, b) in self.dp_sums.iter_mut().zip(other.dp_sums) {
+            *a += b;
+        }
+        for (a, b) in self.dp_counts.iter_mut().zip(other.dp_counts) {
+            *a += b;
+        }
+        for (a, b) in self.info_histograms.iter_mut().zip(other.info_histograms) {
+            debug_assert_eq!(a.name, b.name);
+            a.hist.merge(b.hist);
+        }
+    }
+
     pub fn n_samples(&self) -> usize {
         self.calls.len()
     }
