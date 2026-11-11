@@ -7,7 +7,7 @@
 //!
 //! The same pair drives either the streaming path (stdin, any VCF/BCF,
 //! single-threaded, uncompressed VCF out) or the region-parallel path
-//! (indexed input, [`ParallelVariantWindowProcessor`], bgzf VCF out). Records
+//! (indexed input, [`ParallelVariantWindowProcessor`], bgzf VCF + CSI index out). Records
 //! are parsed and written by htslib, so output is byte-identical to bcftools.
 
 use std::io::{BufWriter, Write};

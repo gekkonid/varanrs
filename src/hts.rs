@@ -824,3 +824,180 @@ impl Drop for Filter {
         unsafe { filter_destroy(self.ptr) };
     }
 }
+
+// ---------------------------------------------------------------------------
+// BGZF compression and on-the-fly CSI indexing
+// ---------------------------------------------------------------------------
+
+/// Uncompressed bytes per BGZF block, as htslib (`BGZF_BLOCK_SIZE`).
+pub const BGZF_BLOCK_SIZE: usize = 0xff00;
+const BGZF_MAX_BLOCK_SIZE: usize = 0x10000;
+/// The standard empty BGZF block marking end of file.
+pub const BGZF_EOF: [u8; 28] = [
+    0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0, 0x42, 0x43, 0x02, 0, 0x1b, 0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Compress `text` into BGZF blocks of [`BGZF_BLOCK_SIZE`] uncompressed
+/// bytes (htslib's `bgzf_compress`, default level), appending to `out`.
+/// Returns each block's start offset relative to the start of `out`'s new
+/// data.
+pub fn bgzf_compress_blocks(text: &[u8], out: &mut Vec<u8>) -> Result<Vec<u64>> {
+    let base = out.len();
+    let mut starts = Vec::with_capacity(text.len().div_ceil(BGZF_BLOCK_SIZE));
+    for chunk in text.chunks(BGZF_BLOCK_SIZE) {
+        let at = out.len();
+        starts.push((at - base) as u64);
+        out.resize(at + BGZF_MAX_BLOCK_SIZE, 0);
+        let mut dlen = BGZF_MAX_BLOCK_SIZE;
+        let r = unsafe {
+            hts::bgzf_compress(
+                out.as_mut_ptr().add(at) as *mut c_void,
+                &mut dlen,
+                chunk.as_ptr() as *const c_void,
+                chunk.len(),
+                -1,
+            )
+        };
+        if r != 0 {
+            bail!("BGZF compression failed");
+        }
+        out.truncate(at + dlen);
+    }
+    Ok(starts)
+}
+
+/// Virtual offset, relative to the start of a run of compressed blocks
+/// (`block_starts`, `total` compressed bytes, holding `len` uncompressed
+/// bytes), of uncompressed position `u` taken as the *end* of the preceding
+/// data — as `bgzf_tell` reports it after reading up to `u`: a position at
+/// the end of a block's data is the start of the next block (possibly
+/// `total`, i.e. just past this run).
+pub fn end_voffset(block_starts: &[u64], total: u64, len: usize, u: usize) -> u64 {
+    if u == len {
+        return total << 16;
+    }
+    let b = u / BGZF_BLOCK_SIZE;
+    (block_starts[b] << 16) | (u % BGZF_BLOCK_SIZE) as u64
+}
+
+const CSI_MIN_SHIFT: c_int = 14;
+const DEFAULT_N_LVLS: c_int = (31 - CSI_MIN_SHIFT + 2) / 3; // TBX_MAX_SHIFT = 31
+
+/// Builds a CSI index (min_shift 14, tabix VCF metadata) while a bgzipped
+/// VCF is written, producing the same index as `bcftools index` /
+/// `tabix --csi` would from the finished file.
+pub struct CsiBuilder {
+    /// Created at the first record, as tbx_index() does (an index of a file
+    /// without records keeps the default number of levels).
+    idx: *mut hts::hts_idx_t,
+    offset0: u64,
+    n_lvls: c_int,
+    last_contig: Option<Arc<str>>,
+    n_contigs: c_int,
+}
+
+// SAFETY: owned and used by one thread at a time.
+unsafe impl Send for CsiBuilder {}
+
+impl CsiBuilder {
+    /// `header_text`: the VCF header as written; `offset0`: the virtual
+    /// offset just after it.
+    pub fn new(header_text: &[u8], offset0: u64) -> Result<Self> {
+        // As tbx_index(): size the levels from the largest ##contig length
+        // (default 100 Gbp).
+        let mut max_len: i64 = 0;
+        for line in header_text.split(|&b| b == b'\n') {
+            if !line.starts_with(b"##contig") {
+                continue;
+            }
+            let Some(p) = line[8..].windows(6).position(|w| w == b"length") else { continue };
+            let rest = &line[8 + p + 6..];
+            let rest = &rest[rest.iter().take_while(|&&c| c == b' ' || c == b'=').count()..];
+            let neg = rest.first() == Some(&b'-');
+            let digits = &rest[usize::from(neg || rest.first() == Some(&b'+'))..];
+            let v = digits
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .fold(0i64, |a, &c| a.saturating_mul(10).saturating_add((c - b'0') as i64));
+            max_len = max_len.max(if neg { -v } else { v });
+        }
+        if max_len == 0 {
+            max_len = 100 * 1024 * 1024 * 1024;
+        }
+        let mut n_lvls: c_int = DEFAULT_N_LVLS;
+        let mut s: i64 = 1 << (CSI_MIN_SHIFT + n_lvls * 3);
+        let max_len = max_len + 256;
+        while max_len > s {
+            n_lvls += 1;
+            s <<= 3;
+        }
+        Ok(Self { idx: ptr::null_mut(), offset0, n_lvls, last_contig: None, n_contigs: 0 })
+    }
+
+    fn init(&mut self, n_lvls: c_int) -> Result<()> {
+        unsafe {
+            let idx = hts::hts_idx_init(0, hts::HTS_FMT_CSI as c_int, self.offset0, CSI_MIN_SHIFT, n_lvls);
+            if idx.is_null() {
+                bail!("failed to initialise the CSI index");
+            }
+            // Tabix VCF configuration: preset, name/beg/end columns, '#', skip,
+            // names length (updated by hts_idx_tbi_name).
+            let mut conf = [0u8; 28];
+            for (i, v) in [hts::TBX_VCF as u32, 1, 2, 0, b'#' as u32, 0, 0].iter().enumerate() {
+                conf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            if hts::hts_idx_set_meta(idx, conf.len() as u32, conf.as_mut_ptr(), 1) < 0 {
+                hts::hts_idx_destroy(idx);
+                bail!("failed to set CSI index metadata");
+            }
+            self.idx = idx;
+        }
+        Ok(())
+    }
+
+    /// Add one record (0-based `beg`, exclusive `end`) whose data ends at
+    /// virtual offset `end_voff`. Records must come in file order.
+    pub fn push(&mut self, contig: &Arc<str>, beg: i64, end: i64, end_voff: u64) -> Result<()> {
+        if self.idx.is_null() {
+            self.init(self.n_lvls)?;
+        }
+        unsafe {
+            if self.last_contig.as_ref() != Some(contig) {
+                self.n_contigs += 1;
+                self.last_contig = Some(Arc::clone(contig));
+            }
+            let name = CString::new(contig.as_bytes())?;
+            let tid = hts::hts_idx_tbi_name(self.idx, self.n_contigs, name.as_ptr());
+            if tid < 0 || hts::hts_idx_push(self.idx, tid, beg, end, end_voff, 1) < 0 {
+                bail!("failed to index record at {contig}:{} (is the input sorted?)", beg + 1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish with the virtual offset of the end of the data and write
+    /// `<vcf_path>.csi`.
+    pub fn save(mut self, final_voff: u64, vcf_path: &Path) -> Result<()> {
+        if self.idx.is_null() {
+            self.init(DEFAULT_N_LVLS)?;
+        }
+        let p = CString::new(vcf_path.to_str().ok_or_else(|| anyhow!("non-UTF-8 path"))?)?;
+        unsafe {
+            if hts::hts_idx_finish(self.idx, final_voff) != 0 {
+                bail!("failed to finish the CSI index");
+            }
+            if hts::hts_idx_save_as(self.idx, p.as_ptr(), ptr::null(), hts::HTS_FMT_CSI as c_int) != 0 {
+                bail!("failed to write {}.csi", vcf_path.display());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CsiBuilder {
+    fn drop(&mut self) {
+        if !self.idx.is_null() {
+            unsafe { hts::hts_idx_destroy(self.idx) };
+        }
+    }
+}

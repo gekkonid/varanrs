@@ -4,10 +4,11 @@
 //! windows, and processes the windows in parallel: each worker opens its own
 //! indexed reader, queries its assigned region, applies a per-worker record
 //! function to every record, and serialises the kept records to an in-memory
-//! VCF text buffer (htslib `vcf_format`, so byte-identical to bcftools). The
-//! main thread re-orders the per-window buffers and feeds them to a
-//! multithreaded BGZF writer, so the output is correctly ordered and
-//! compressed in parallel.
+//! VCF text buffer (htslib `vcf_format`, so byte-identical to bcftools),
+//! which it compresses into its own BGZF blocks (so compression is parallel
+//! too), noting where each record ends. The main thread writes the windows
+//! in order and, from those positions, builds a CSI index on the fly
+//! (`<output>.csi`, identical to what `bcftools index` would build).
 //!
 //! Contigs are processed in file order (the order of their data in the
 //! index), matching `bcftools view`.
@@ -20,15 +21,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::Write as _;
-use std::num::NonZeroUsize;
+use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
 use indexmap::IndexMap;
-use noodles_bgzf as bgzf;
 use rust_htslib::bcf::Record;
 
 use crate::hts::{self, HeaderView, KString, SampleSubset, VcfReader};
@@ -46,6 +45,15 @@ const MAX_POS: u64 = i32::MAX as u64;
 pub type RecordFn = Box<dyn FnMut(&mut Record) -> Result<bool>>;
 type RecordFactory = dyn Fn(&Arc<HeaderView>) -> Result<RecordFn> + Send + Sync;
 type ProgressCallback = dyn Fn(u64, usize, usize) + Send + Sync + 'static;
+
+/// A processed window: compressed BGZF blocks and, per kept record, its
+/// 0-based start, exclusive end, and end virtual offset relative to the
+/// start of `data`.
+#[derive(Default)]
+struct WindowOut {
+    data: Vec<u8>,
+    index: Vec<(i64, i64, u64)>,
+}
 
 /// One unit of work, in output order: either a window to query, or a span of
 /// windows the index proves to be empty (nothing is read for it).
@@ -282,26 +290,28 @@ impl ParallelVariantWindowProcessor {
         let total_abs: usize = contigs.last().map_or(0, |c| c.first_abs + c.n_windows(window_size));
         let total_windows = total_abs.div_ceil(stride);
 
-        // 2. Open output and write the header through a multithreaded bgzf
-        //    writer. Without an output path, run in side-effect-only mode.
-        let mut mt_writer = match output.as_ref() {
+        // 2. Open output, write the (compressed) header and start the index.
+        //    Without an output path, run in side-effect-only mode.
+        let mut out = match output.as_ref() {
             Some(path) => {
                 let file = File::create(path)
                     .with_context(|| format!("failed to create output: {}", path.display()))?;
-                let mut w = bgzf::io::multithreaded_writer::Builder::default()
-                    .set_worker_count(NonZeroUsize::new(worker_threads).unwrap())
-                    .build_from_writer(file);
-                w.write_all(&header_text).context("failed to write VCF header")?;
-                Some(w)
+                let mut w = BufWriter::with_capacity(1 << 20, file);
+                let mut hdr = Vec::new();
+                let starts = hts::bgzf_compress_blocks(&header_text, &mut hdr)?;
+                let offset0 = if header_text.is_empty() { 0 } else { hts::end_voffset(&starts, hdr.len() as u64, header_text.len(), header_text.len()) };
+                w.write_all(&hdr).context("failed to write VCF header")?;
+                let csi = hts::CsiBuilder::new(&header_text, offset0)?;
+                Some((w, csi, hdr.len() as u64))
             }
             None => None,
         };
-        let serialize = mt_writer.is_some();
+        let serialize = out.is_some();
 
         // 3. Channels. Every window in flight holds a permit, so the channels
         //    never need more capacity than `max_in_flight`.
         let (work_tx, work_rx) = bounded::<Window>(max_in_flight);
-        type Out = (usize, usize, u64, Result<Vec<u8>>);
+        type Out = (usize, usize, u64, Arc<str>, Result<WindowOut>);
         let (out_tx, out_rx) = bounded::<Out>(max_in_flight);
         let (permit_tx, permit_rx) = bounded::<()>(max_in_flight);
         for _ in 0..max_in_flight {
@@ -372,7 +382,7 @@ impl ParallelVariantWindowProcessor {
                             // the producer is not blocked.
                             let msg = format!("{e:#}");
                             while let Ok(w) = work_rx.recv() {
-                                let _ = out_tx.send((w.idx, w.n_windows, w.bp, Err(anyhow!("{msg}"))));
+                                let _ = out_tx.send((w.idx, w.n_windows, w.bp, w.contig, Err(anyhow!("{msg}"))));
                             }
                             return;
                         }
@@ -382,13 +392,14 @@ impl ParallelVariantWindowProcessor {
                     // which must therefore differ between consecutive records.
                     let mut recs = [reader.empty_record(), reader.empty_record()];
                     let mut ks = KString::new();
+                    let mut text = Vec::new();
                     while let Ok(window) = work_rx.recv() {
                         let result = if window.skip {
-                            Ok(Vec::new())
+                            Ok(WindowOut::default())
                         } else {
-                            process_window(&mut reader, &mut recs, &mut ks, serialize, &window, &mut f)
+                            process_window(&mut reader, &mut recs, &mut ks, &mut text, serialize, &window, &mut f)
                         };
-                        if out_tx.send((window.idx, window.n_windows, window.bp, result)).is_err() {
+                        if out_tx.send((window.idx, window.n_windows, window.bp, window.contig, result)).is_err() {
                             break;
                         }
                     }
@@ -397,15 +408,15 @@ impl ParallelVariantWindowProcessor {
             drop(out_tx);
 
             // Writer / re-orderer / progress (main scope thread).
-            let mut buffer: BTreeMap<usize, (usize, u64, Vec<u8>)> = BTreeMap::new();
+            let mut buffer: BTreeMap<usize, (usize, u64, Arc<str>, WindowOut)> = BTreeMap::new();
             let mut next_idx = 0usize;
             let mut done_windows = 0usize;
             let mut cum_bp: u64 = 0;
             let mut first_error: Option<anyhow::Error> = None;
-            while let Ok((idx, n, bp, result)) = out_rx.recv() {
+            while let Ok((idx, n, bp, contig, result)) = out_rx.recv() {
                 match result {
                     Ok(bytes) => {
-                        buffer.insert(idx, (n, bp, bytes));
+                        buffer.insert(idx, (n, bp, contig, bytes));
                     }
                     Err(e) => {
                         // Fail the run: never silently drop data.
@@ -413,9 +424,13 @@ impl ParallelVariantWindowProcessor {
                         break;
                     }
                 }
-                while let Some((n, bp, bytes)) = buffer.remove(&next_idx) {
-                    if let Some(w) = mt_writer.as_mut() {
-                        w.write_all(&bytes).context("failed to write window bytes")?;
+                while let Some((n, bp, contig, win)) = buffer.remove(&next_idx) {
+                    if let Some((w, csi, offset)) = out.as_mut() {
+                        w.write_all(&win.data).context("failed to write window bytes")?;
+                        for &(beg, end, rel) in &win.index {
+                            csi.push(&contig, beg, end, rel + (*offset << 16))?;
+                        }
+                        *offset += win.data.len() as u64;
                     }
                     cum_bp += bp;
                     done_windows += n;
@@ -443,8 +458,12 @@ impl ParallelVariantWindowProcessor {
             Ok(())
         })?;
 
-        if let Some(mut w) = mt_writer {
-            w.finish().context("failed to finalize bgzf writer")?;
+        if let Some((mut w, csi, offset)) = out {
+            w.write_all(&hts::BGZF_EOF).context("failed to write the BGZF EOF block")?;
+            w.flush().context("failed to write output")?;
+            // As read back by `bcftools index`: the data ends where the EOF
+            // block starts.
+            csi.save(offset << 16, output.as_ref().unwrap())?;
         }
         Ok(())
     }
@@ -634,17 +653,21 @@ fn process_window(
     reader: &mut VcfReader,
     recs: &mut [Record; 2],
     ks: &mut KString,
+    text: &mut Vec<u8>,
     serialize: bool,
     window: &Window,
     f: &mut RecordFn,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+) -> Result<WindowOut> {
+    let mut out = WindowOut::default();
     let Some(tid) = reader.tid(&window.contig) else {
-        return Ok(bytes);
+        return Ok(out);
     };
     let mut itr = reader
         .query(tid, window.start as i64 - 1, window.end as i64)
         .ok_or_else(|| anyhow!("index query failed for {}:{}-{}", window.contig, window.start, window.end))?;
+    // (beg, end, uncompressed end offset) per kept record
+    let mut ends: Vec<(i64, i64, usize)> = Vec::new();
+    text.clear();
     let mut cur = 0usize;
     loop {
         cur ^= 1;
@@ -662,8 +685,20 @@ fn process_window(
             continue;
         }
         if f(rec).with_context(|| format!("at {}", hts::rec_locus(rec)))? && serialize {
-            hts::format_record(rec, ks, &mut bytes)?;
+            hts::format_record(rec, ks, text)?;
+            let beg = rec.pos();
+            let end = beg + rec.inner().rlen;
+            ends.push((beg, end, text.len()));
         }
     }
-    Ok(bytes)
+    if !text.is_empty() {
+        let starts = hts::bgzf_compress_blocks(text, &mut out.data)?;
+        let total = out.data.len() as u64;
+        out.index = ends.into_iter().map(|(b, e, u)| (b, e, hts::end_voffset(&starts, total, text.len(), u))).collect();
+    }
+    // Don't let one huge window pin a large buffer for the worker's lifetime.
+    if text.capacity() > 16 << 20 {
+        *text = Vec::new();
+    }
+    Ok(out)
 }

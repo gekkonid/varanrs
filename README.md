@@ -29,7 +29,7 @@ This toolkit consists of several tools for VCF/BCF manipulation:
 
 ### Input formats
 
-- Region-parallel subcommands: `.vcf.gz` or `.bcf` with a `.csi` or `.tbi` index. Output is bgzipped VCF, in the same contig order as the input file. Contig lengths come from the header or `--fai`; records beyond a declared (or missing) length are still found via the index, so no records are lost to a wrong header.
+- Region-parallel subcommands: `.vcf.gz` or `.bcf` with a `.csi` or `.tbi` index. Output is bgzipped VCF, in the same contig order as the input file, always written with a CSI index (`<output>.csi`, as `bcftools ... --write-index`).  Contig lengths come from the header or `--fai`; records beyond a declared (or missing) length are still found via the index, so no records are lost to a wrong header.
 - Streaming subcommands: input VCF or BCF from stdin, compressed or not (auto-detected), output VCF text. Single-threaded, designed to be used in some larger filtering pipeline.
 
 Many tools default to streaming, unless you give an input file, in which case they'll use region-parallel iteration and require an index.

@@ -16,7 +16,6 @@ rust-htslib = { version = "1.0", default-features = false, features = ["static",
 # Direct dependency so build.rs receives DEP_HTS_INCLUDE (htslib headers) for
 # compiling the vendored bcftools filter.c.
 hts-sys = { version = "2.2", default-features = false, features = ["static", "libdeflate"] }
-noodles-bgzf = "0.46"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 crossbeam-channel = "0.5"

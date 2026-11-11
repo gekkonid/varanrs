@@ -306,3 +306,70 @@ chr1\t200\t.\tA\tC\t50\t.\t.\tGT:DP\t0/1:9\t1/1:.\t0/1:1\t./.:2
     assert!(body(&site)[0].ends_with("\t./.:2\t./.:10\t.:0\t./.:3"));
     assert!(body(&site)[0].contains("\tAC=0;AN=0\t"));
 }
+
+/// Region-parallel output always gets a CSI index, identical to the one
+/// `bcftools index` builds from the same file, including when windows span
+/// several BGZF blocks.
+#[test]
+fn parallel_output_has_bcftools_identical_csi_index() -> Result<()> {
+    if !common::check_tools(&["bgzip", "tabix", "bcftools"]) {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    // ~3 MB of records on two contigs: windows of 100 kb hold several blocks
+    let mut text = String::from(
+        "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=2000000>\n##contig=<ID=chr2,length=2000000>\n\
+         ##INFO=<ID=XX,Number=1,Type=String,Description=\"padding\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+    );
+    for chrom in ["chr1", "chr2"] {
+        for i in 0..15_000u32 {
+            let pos = 1 + i * 97;
+            let pad = "A".repeat(50 + (i as usize * 7919) % 120);
+            text.push_str(&format!("{chrom}\t{pos}\t.\tA\tC,T\t{}\t.\tXX={pad}\n", i % 60));
+        }
+    }
+    let input = dir.path().join("in.vcf.gz");
+    write_indexed_vcf(&input, &text);
+
+    let ours = dir.path().join("ours.vcf.gz");
+    varanrs::commands::filter::run(varanrs::commands::filter::FilterArgs {
+        indexed: varanrs::args::IndexedInput { input: Some(input.clone()), threads: Some(4), contig: vec![], fai: None },
+        output: Some(ours.display().to_string()),
+        window_size: Some(100_000),
+        exclude: Some("QUAL<5".into()),
+        include: None,
+        soft_filter: None,
+        mode: None,
+        min_ac: None,
+        min_af: None,
+        fill_tags: None,
+        samples_file: None,
+        include_genotypes: None,
+        exclude_genotypes: None,
+    })?;
+    let csi = dir.path().join("ours.vcf.gz.csi");
+    assert!(csi.exists(), "no index written");
+    let theirs = dir.path().join("theirs.csi");
+    let st = Command::new("bcftools")
+        .args(["index", "-f", "-o"])
+        .arg(&theirs)
+        .arg(&ours)
+        .status()?;
+    assert!(st.success());
+    let unz = |p: &Path| Command::new("bgzip").arg("-dc").arg(p).output().unwrap().stdout;
+    assert_eq!(unz(&csi), unz(&theirs), "CSI index differs from `bcftools index`");
+    // and region queries through it work
+    let q = bcftools_body(&["view", "-H", "-r", "chr2:500000-500500", ours.to_str().unwrap()]);
+    let expect = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "bcftools filter -e 'QUAL<5' -r chr2:500000-500500 {} | grep -v '^#'",
+            input.display()
+        ))
+        .output()?
+        .stdout;
+    assert_eq!(q, String::from_utf8(expect)?);
+    assert!(!q.is_empty());
+    Ok(())
+}
