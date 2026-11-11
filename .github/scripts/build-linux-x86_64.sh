@@ -18,6 +18,11 @@ yum install -y bcftools htslib htslib-tools
 PY=/opt/python/cp312-cp312/bin/python
 "$PY" -m pip install --quiet libclang
 export LIBCLANG_PATH="$("$PY" -c 'import clang, os; print(os.path.join(os.path.dirname(clang.__file__), "native"))')"
+# The wheel ships libclang without clang's builtin headers (stddef.h,
+# stdarg.h, ...); use the compiler's own builtin include directory instead.
+export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
+echo "LIBCLANG_PATH=${LIBCLANG_PATH}"
+echo "BINDGEN_EXTRA_CLANG_ARGS=${BINDGEN_EXTRA_CLANG_ARGS}"
 
 cargo build --verbose --release
 .github/scripts/check-linkage.sh target/release/varanrs

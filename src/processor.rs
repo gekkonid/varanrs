@@ -294,6 +294,20 @@ impl ParallelVariantWindowProcessor {
         //    Without an output path, run in side-effect-only mode.
         let mut out = match output.as_ref() {
             Some(path) => {
+                // An index left by an earlier run must never be paired with
+                // this run's data (e.g. if this run fails or is killed before
+                // its own index is written).
+                for ext in ["csi", "tbi"] {
+                    let mut p = path.clone().into_os_string();
+                    p.push(format!(".{ext}"));
+                    match std::fs::remove_file(&p) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("failed to remove stale index {}", p.to_string_lossy()));
+                        }
+                    }
+                }
                 let file = File::create(path)
                     .with_context(|| format!("failed to create output: {}", path.display()))?;
                 let mut w = BufWriter::with_capacity(1 << 20, file);
