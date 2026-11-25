@@ -10,3 +10,4 @@ pub mod hts;
 pub mod processor;
 pub mod snpsketch;
 pub mod util;
+pub mod windowstats;

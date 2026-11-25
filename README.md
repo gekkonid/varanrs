@@ -17,6 +17,8 @@ This toolkit consists of several tools for VCF/BCF manipulation:
 
 * [`varanrs fill-tags`](#fill-tags): parallel recomputation of AN, AC, AF, MAF, NS, AC_Het/Hom/Hemi, HWE, ExcHet and F_MISSING from genotypes, matching `bcftools +fill-tags`.
 
+* [`varanrs window-stats`](#window-stats): parallel per-window means of numeric INFO fields (e.g. `AC_Het`), optionally recomputing tags first.
+
 * [`varanrs uppercase-alleles`](#uppercase-alleles): forces REF and ALT columns to upper case to work around bugs in various programs.
 
 * And more coming as soon as I need them...
@@ -219,6 +221,35 @@ bcftools view -Ou in.bcf | varanrs fill-tags -t AC,AN,AF | bcftools view -Oz -o 
 | `-t, --tags <LIST>` | `all` | Comma-separated tags to fill |
 | `-d, --drop-missing` | off | Do not count half-missing genotypes (`./1`) as hemizygous |
 | `--threads`, `--contig`, `--fai`, `--window-size` | `--window-size 16384` | As for other region-parallel commands. At most 2 × threads windows are held in memory at once. |
+
+### `window-stats`
+
+Average numeric INFO fields over fixed-size, non-overlapping genomic windows.
+Each site is assigned to the window containing its POS. For each window and
+tag, the mean is taken over sites with a non-missing value. For multi-valued
+fields (Number=A/R), only the first ALT allele's value is used, as in
+`snpsketch --info-stats`. With `--fill-tags`, tags are recomputed from the
+genotypes first, as in `filter`, so fields that are absent or out of date
+(e.g. after filtering) can be averaged.
+
+```
+varanrs window-stats --fill-tags AC_Het -t AC_Het,AF -w 100000 in.bcf -o windows.csv --threads 16
+bcftools view -Ou -s A,B,C in.bcf | varanrs window-stats --fill-tags all -t AC_Het,F_MISSING > windows.csv
+```
+
+The output CSV has the columns `contig, start, end, n_sites, <tag>...`, with
+1-based inclusive coordinates. Every window up to the contig length (from the
+header or `--fai`) is reported. Windows without sites have `n_sites=0`, and a
+tag with no values in a window gets an empty cell.
+
+| Flag | Default | Description |
+|---|---|---|
+| `<INPUT>` | stdin | Indexed VCF/BCF, or omit for stdin |
+| `-t, --tags <LIST>` | *(required)* | Comma-separated Integer/Float INFO fields to average |
+| `-w, --window-size <BP>` | `100000` | Window size in bp (also the parallel work unit) |
+| `--fill-tags <TAGS>` | *(none)* | Tags to recompute first (see `fill-tags`) |
+| `-o, --output <PATH>` | stdout | Output CSV path |
+| `--threads`, `--contig`, `--fai` | | As for other region-parallel commands |
 
 ### `uppercase-alleles`
 

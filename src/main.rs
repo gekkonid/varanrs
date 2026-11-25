@@ -23,6 +23,8 @@ enum Command {
     Snpsketch(commands::snpsketch::SketchArgs),
     /// Force REF and ALT alleles to uppercase (GLnexus workaround).
     UppercaseAlleles(commands::uppercase_alleles::UppercaseAllelesArgs),
+    /// Average numeric INFO fields over fixed-size genomic windows.
+    WindowStats(commands::window_stats::WindowStatsArgs),
 }
 
 fn main() -> Result<()> {
@@ -32,5 +34,6 @@ fn main() -> Result<()> {
         Command::FillTags(args) => commands::fill_tags::run(args),
         Command::Snpsketch(args) => commands::snpsketch::run(args),
         Command::UppercaseAlleles(args) => commands::uppercase_alleles::run(args),
+        Command::WindowStats(args) => commands::window_stats::run(args),
     }
 }

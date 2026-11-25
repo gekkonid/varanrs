@@ -6,3 +6,4 @@ pub mod filter;
 pub mod io;
 pub mod snpsketch;
 pub mod uppercase_alleles;
+pub mod window_stats;
